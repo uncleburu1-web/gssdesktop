@@ -1,0 +1,57 @@
+{
+  "name": "desktop",
+  "version": "1.0.0",
+  "description": "GSS POS desktop till — offline-first, local SQLite, syncs to the Django/Postgres cloud backend when online.",
+  "main": "src/main/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "electron .",
+    "dist:win": "electron-builder --win"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^16.4.5",
+    "electron-updater": "^6.3.9",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-router-dom": "^7.18.2"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.1.0",
+    "electron": "^44.0.0",
+    "electron-builder": "^25.1.8",
+    "vite": "^8.2.2"
+  },
+  "build": {
+    "appId": "com.gss.pos",
+    "productName": "GSS POS",
+    "files": [
+      "src/main/**/*",
+      "renderer-dist/**/*",
+      "package.json",
+      ".env"
+    ],
+    "directories": {
+      "output": "dist-installer"
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "artifactName": "GSS-Setup.exe"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "uncleburu1-web",
+        "repo": "gssdesktop"
+      }
+    ]
+  }
+}

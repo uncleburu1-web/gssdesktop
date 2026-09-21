@@ -1,0 +1,93 @@
+name: Build Windows Installer
+
+# Runs automatically every time you push to main, and can also be
+# triggered manually from the Actions tab with the "Run workflow" button —
+# same trigger shape as the mobile app's build-android.yml.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Needed so this workflow's own GITHUB_TOKEN is allowed to create/update
+# a Release (the default token is read-only on some repos/orgs).
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Pinned to windows-2022 (Visual Studio 2022) rather than windows-latest
+    # on purpose: GitHub moved the windows-latest image to Windows Server
+    # 2025 + Visual Studio 2026 in June 2026, and node-gyp — which has to
+    # compile better-sqlite3's native code — doesn't know how to detect
+    # VS2026 yet (open upstream bug: nodejs/node-gyp#3282). windows-2022
+    # still ships VS2022, which node-gyp fully supports. GitHub's own
+    # migration notice names this exact runs-on value as the fix:
+    # https://github.com/actions/runner-images/issues/14017
+    runs-on: windows-2022
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # node-gyp (which compiles better-sqlite3's native code) is stuck on
+      # an old version that depends on Python's `distutils` module —
+      # removed from Python 3.12, which is windows-2022's default. Pinning
+      # to 3.11 (last version that still ships distutils) sidesteps the
+      # whole issue rather than patching around it. See nodejs/node-gyp's
+      # own docs: "Python >= v3.12 requires node-gyp >= v10".
+      - name: Set up Python 3.11 (node-gyp compatibility)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # .env is gitignored on purpose (never commit secrets), the same way
+      # mobile's .env is — see mobile-android/mobile/.gitignore. But unlike
+      # the mobile app, which only needs VITE_API_URL at *build* time,
+      # this app's main process reads BENCHLINE_API_URL from an actual
+      # .env file on disk at *runtime* (src/main/main.js, via dotenv) —
+      # package.json's "build.files" bundles that file into the packaged
+      # app. Skip this step and the installer would ship pointing at
+      # localhost, and silently try to spawn a local backend instead of
+      # talking to production (see src/main/backendLauncher.js).
+      - name: Write production .env
+        shell: bash
+        run: echo "BENCHLINE_API_URL=https://gss-production.up.railway.app/api" > .env
+
+      # electron-updater compares package.json's own "version" field
+      # against the version published in the release feed to decide
+      # whether an update exists — it has to strictly increase on every
+      # build, or every install would look "already up to date" forever.
+      # This workflow's own run number does that with no manual bumping.
+      - name: Stamp the build version
+        shell: bash
+        run: npm version "1.0.${{ github.run_number }}" --no-git-tag-version
+
+      - name: Build the renderer (Vite)
+        run: npm run build
+
+      - name: Build & publish the Windows installer (electron-builder)
+        # --publish always: package.json's "build.publish" (added alongside
+        # this workflow) points electron-builder at the gssdesktop GitHub
+        # repo, so this both creates the Release the download button on
+        # the website links to AND uploads the latest.yml metadata file
+        # electron-updater needs to detect this as a newer version.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run dist:win -- --publish always
+
+      - name: Upload the installer as a build artifact too
+        # Belt-and-braces: the Release above is the real distribution
+        # path now, but keeping this means a build's exact output is
+        # still inspectable from the Actions run itself if something
+        # about the Release step ever needs debugging.
+        uses: actions/upload-artifact@v4
+        with:
+          name: gss-pos-windows-installer
+          path: dist-installer/*.exe
