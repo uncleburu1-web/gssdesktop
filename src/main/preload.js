@@ -21,6 +21,12 @@ contextBridge.exposeInMainWorld('pos', {
   getProfile: () => ipcRenderer.invoke('pos:getProfile'),
   hasLocalSetup: () => ipcRenderer.invoke('pos:hasLocalSetup'),
   logout: () => ipcRenderer.invoke('pos:logout'),
+  // Printer setup (see main.js's "Printing" block) + the actual print
+  // trigger a completed sale calls instead of window.print().
+  listPrinters: () => ipcRenderer.invoke('printers:list'),
+  getSelectedPrinter: () => ipcRenderer.invoke('printers:getSelected'),
+  setSelectedPrinter: (deviceName) => ipcRenderer.invoke('printers:setSelected', deviceName),
+  printReceipt: () => ipcRenderer.invoke('print:receipt'),
   // Fired whenever the sync engine pulls and applies new data from the
   // cloud (a web sale, a product added elsewhere, etc.) — see sync.js's
   // pullTick and main.js's onDataChanged wiring. Returns an unsubscribe

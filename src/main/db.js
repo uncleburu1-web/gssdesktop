@@ -108,6 +108,27 @@ function setLastPullAt(db, iso) {
 }
 
 /**
+ * Generic per-device key/value read on the same app_settings table
+ * next_invoice_number/last_pull_at already live in. Used for local-only
+ * preferences that have no business meaning to sync to the cloud — right
+ * now just which physical printer THIS till's receipts go to (see
+ * printers:getSelected/printers:setSelected in main.js). Deliberately
+ * not synced: a shop with 3 tills can have 3 different printers, and the
+ * cloud/other devices have no business knowing or caring which.
+ */
+function getSetting(db, key) {
+  const row = db.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key);
+  return row ? row.value : null;
+}
+
+function setSetting(db, key, value) {
+  db.prepare(
+    `INSERT INTO app_settings (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+  ).run(key, value == null ? '' : value);
+}
+
+/**
  * Appends one outbox row. Every write to shop data goes through this so
  * the sync engine has something to push later. Deliberately NOT called
  * for stock_batch quantity_remaining deductions caused by a sale — per
@@ -591,6 +612,8 @@ module.exports = {
   applyPulledOperation,
   getLastPullAt,
   setLastPullAt,
+  getSetting,
+  setSetting,
   pruneSyncQueue,
   reconcileUnsyncedRows,
 };

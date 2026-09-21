@@ -67,11 +67,14 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
   // Every completed sale auto-prints a receipt: `lastReceipt` becomes a
   // new object each time charge() succeeds, so this fires once per sale.
   // The printable node (Receipt, rendered below) is invisible on screen
-  // either way (theme.css) — it only needs to be in the DOM before
-  // window.print() runs, which the rAF here waits one paint for.
+  // either way (theme.css) — it only needs to be in the DOM before print
+  // runs, which the rAF here waits one paint for. print:receipt (main.js)
+  // replaces the old window.print(): once a printer is picked on the
+  // Printer screen it prints silently straight to it; until then it falls
+  // back to the same pick-a-printer dialog window.print() used to show.
   useEffect(() => {
     if (!lastReceipt) return;
-    const id = requestAnimationFrame(() => window.print());
+    const id = requestAnimationFrame(() => { window.pos.printReceipt(); });
     return () => cancelAnimationFrame(id);
   }, [lastReceipt]);
 

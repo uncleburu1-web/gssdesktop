@@ -108,6 +108,50 @@ app.whenReady().then(() => {
     return { ok: true };
   });
 
+  // --- Printing ----------------------------------------------------------
+  // Receipts print via THIS process's webContents.print(), not the
+  // renderer's window.print() — only the main process can pass `silent`
+  // plus a specific `deviceName`, which is what turns "sale complete -> a
+  // print dialog pops up and someone has to click Print" into "sale
+  // complete -> paper just comes out." Until a printer has actually been
+  // picked (Printer nav screen), RECEIPT_PRINTER_KEY is unset, deviceName
+  // stays '', and print:receipt falls back to the exact old behaviour —
+  // the normal pick-a-printer-and-click-Print dialog — so a fresh install
+  // never silently drops a receipt on the floor.
+  const RECEIPT_PRINTER_KEY = 'receipt_printer_name';
+
+  ipcMain.handle('printers:list', async () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return [];
+    return mainWindow.webContents.getPrintersAsync();
+  });
+  ipcMain.handle('printers:getSelected', () => db.getSetting(database, RECEIPT_PRINTER_KEY) || '');
+  ipcMain.handle('printers:setSelected', (_e, deviceName) => {
+    db.setSetting(database, RECEIPT_PRINTER_KEY, deviceName || '');
+    return { ok: true };
+  });
+  ipcMain.handle('print:receipt', () => new Promise((resolve) => {
+    if (!mainWindow || mainWindow.isDestroyed()) { resolve({ ok: false, reason: 'no-window' }); return; }
+    const deviceName = db.getSetting(database, RECEIPT_PRINTER_KEY) || '';
+    const printOptions = { printBackground: true, margins: { marginType: 'none' } };
+
+    function printWithDialog() {
+      mainWindow.webContents.print({ ...printOptions, silent: false }, (ok, reason) => {
+        resolve({ ok, reason: ok ? null : reason });
+      });
+    }
+
+    if (!deviceName) { printWithDialog(); return; } // never configured yet — behave exactly like the old window.print()
+
+    mainWindow.webContents.print({ ...printOptions, silent: true, deviceName }, (ok, reason) => {
+      if (ok) { resolve({ ok, reason: null }); return; }
+      // Saved printer is off, unplugged, or was renamed/uninstalled —
+      // rather than silently losing the receipt, fall back to the normal
+      // pick-a-printer dialog once instead of just failing.
+      console.warn(`[print] silent print to "${deviceName}" failed (${reason}) — falling back to the print dialog`);
+      printWithDialog();
+    });
+  }));
+
   createWindow();
   // Passed as a getter, not the value itself, since a user can close and
   // reopen the window (see the app.on('activate') handler below) — the
