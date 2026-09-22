@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const API_BASE = process.env.BENCHLINE_API_URL || 'http://localhost:8000/api';
 const { getOrCreateDeviceId } = require('./device');
 
@@ -61,11 +62,114 @@ function storeUserProfile(db, profile) {
 }
 
 /**
- * The desktop's ONE dependency on the network being reachable for a
- * given login: authenticating the username/password itself always has
- * to reach the server (there's no safe way to check a password purely
- * locally). What happens AFTER that differs by whether this device has
- * already been set up:
+ * Per-username salted password hashes, cached purely so login() can
+ * verify a password without the server when there's no internet at all.
+ * scrypt (Node's built-in, no extra dependency — matters for an Electron
+ * app that has to package cleanly) is deliberately slow/memory-hard, so
+ * even someone with the raw SQLite file can't cheaply brute-force it.
+ * Keyed by username (not a single slot) because more than one seller can
+ * share a till, each having logged in online at some point — any of them
+ * should be able to fall back to offline login later, not just whoever
+ * happened to log in most recently.
+ */
+function getOfflineCredentials(db) {
+  const row = db.prepare(`SELECT value FROM app_settings WHERE key = 'offline_credentials'`).get();
+  return row ? JSON.parse(row.value) : {};
+}
+
+function storeOfflineCredential(db, username, password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  const all = getOfflineCredentials(db);
+  all[username] = { salt, hash, cachedAt: new Date().toISOString() };
+  db.prepare(
+    `INSERT INTO app_settings (key, value) VALUES ('offline_credentials', ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+  ).run(JSON.stringify(all));
+}
+
+function verifyOfflinePassword(password, stored) {
+  const candidate = crypto.scryptSync(password, stored.salt, 64);
+  const expected = Buffer.from(stored.hash, 'hex');
+  // Lengths always match (both are scrypt(..., 64)), but timingSafeEqual
+  // throws on a length mismatch rather than returning false — guard it
+  // defensively in case an older/corrupt cache entry ever has a different
+  // hash length.
+  if (candidate.length !== expected.length) return false;
+  return crypto.timingSafeEqual(candidate, expected);
+}
+
+/**
+ * This user's own role/name, cached per-username (separately from the
+ * single "whoever is currently signed in" user_profile row below) purely
+ * so an OFFLINE login can restore the right person's role — without this,
+ * a seller logging in offline after an owner used the till last would
+ * incorrectly inherit the owner's cached profile instead of their own.
+ */
+function getOfflineProfiles(db) {
+  const row = db.prepare(`SELECT value FROM app_settings WHERE key = 'offline_profiles'`).get();
+  return row ? JSON.parse(row.value) : {};
+}
+
+function storeOfflineProfile(db, username, profile) {
+  const all = getOfflineProfiles(db);
+  all[username] = profile;
+  db.prepare(
+    `INSERT INTO app_settings (key, value) VALUES ('offline_profiles', ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+  ).run(JSON.stringify(all));
+}
+
+/**
+ * The fallback path when login()'s fetch to /auth/login/ never got a
+ * response at all — no internet, DNS failure, or the 8s timeout firing.
+ * NEVER reached when the server was actually reachable and rejected the
+ * password (see login() below): only a genuinely unreachable server may
+ * fall back to a locally cached hash, so a recently-changed or revoked
+ * password online is never bypassable just by cutting the network.
+ *
+ * Deliberately does NOT touch auth_tokens: there's no way to obtain a
+ * real JWT without the server, so whatever's already stored (possibly
+ * stale, possibly another user's from their last online login) is left
+ * exactly as-is. That's fine — local reads/writes never check the token,
+ * only sync.js/heartbeat.js do, and both already treat "the server
+ * rejected our token" as just another offline-style condition to retry
+ * later. The one real consequence: isLoggedIn() on the NEXT app restart
+ * still reflects whatever that stale token implies, not this offline
+ * session — acceptable, since normal login (online or offline) always
+ * runs again at that point anyway.
+ */
+function loginOffline(db, username, password) {
+  const cached = getOfflineCredentials(db)[username];
+  if (!cached) {
+    const err = new Error(`No internet, and no saved sign-in for "${username}" on this till yet — sign in once online first.`);
+    err.code = 'offline_no_account';
+    throw err;
+  }
+  if (!verifyOfflinePassword(password, cached)) {
+    const err = new Error('Wrong password.');
+    err.code = 'offline_wrong_password';
+    throw err;
+  }
+  const profile = getOfflineProfiles(db)[username]
+    || { username, full_name: null, is_owner: false, is_ceo: false, role: 'seller' }; // safe low-privilege default — same one the online path falls back to if /me/ was never reached
+  storeUserProfile(db, profile);
+  return { offline: true };
+}
+
+/**
+ * Authenticating a username/password FIRST tries the server, same as
+ * ever — the source of truth for whether a password is currently
+ * correct. Only when the server can't be reached at all (see
+ * loginOffline() above) does this fall back to a locally cached, salted
+ * hash from that user's last successful ONLINE login. A server that
+ * responds and rejects the password is never treated as "offline" — that
+ * distinction is exactly what the try/catch around the fetch below is
+ * for: a thrown error means the request never completed; `!res.ok` means
+ * it did, and the server said no.
+ *
+ * What happens after a successful ONLINE login differs by whether this
+ * device has already been set up:
  *   - First login ever on this till: nothing is cached yet, so we fetch
  *     /api/me/ and save both the shop-level settings (name, address,
  *     contact, logo, receipt footer, business type, service/pharmacy
@@ -93,12 +197,17 @@ function storeUserProfile(db, profile) {
  */
 async function login(db, username, password) {
   const deviceId = getOrCreateDeviceId(db);
-  const res = await fetch(`${API_BASE}/auth/login/`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password, device_id: deviceId, device_type: 'desktop' }),
-    signal: AbortSignal.timeout(8000),
-  });
+  let res;
+  try {
+    res = await fetch(`${API_BASE}/auth/login/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password, device_id: deviceId, device_type: 'desktop' }),
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch {
+    return loginOffline(db, username, password);
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     const detail = Array.isArray(body.detail) ? body.detail[0] : body.detail;
@@ -109,6 +218,12 @@ async function login(db, username, password) {
   }
   const tokens = await res.json();
   storeTokens(db, tokens);
+  // The password is confirmed correct by the server AT THIS EXACT
+  // MOMENT — exactly the right time to (re)cache it for offline login
+  // later. Overwrites whatever was cached before for this username, so a
+  // changed password always replaces the old offline hash rather than
+  // leaving a stale one that would otherwise still work offline.
+  storeOfflineCredential(db, username, password);
 
   // Same network window as the login call above — /api/me/ returns both
   // this user's role and the shop's full setup in one shot, so no
@@ -139,13 +254,15 @@ async function login(db, username, password) {
         // a gadgets shop, and everyone gets offered "Laptop".
         business_type: me.business_type || 'general',
       });
-      storeUserProfile(db, {
+      const profile = {
         username: me.username,
         full_name: me.full_name,
         is_owner: me.is_owner,
         is_ceo: Boolean(me.is_ceo),
         role: me.role,
-      });
+      };
+      storeUserProfile(db, profile);
+      storeOfflineProfile(db, username, profile); // so THIS user's own role/name is what offline login restores later, not whoever logged in last
     }
   } catch {
     // Login itself already succeeded — don't fail the whole sign-in over
