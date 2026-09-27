@@ -275,6 +275,7 @@ function startSyncEngine(db, onDataChanged) {
   let wsRetryTimer = null;
   let stopped = false;
   let hasConnectedBefore = false; // distinguishes the first connect (nothing to reconcile yet — pullTick above already did a full sync) from a RECONNECT after a drop (exactly the "once it detects internet again" moment worth double-checking)
+  let wsReconnectCount = 0; // observability only (see getStatus below) — how flaky has this till's connection actually been today
 
   function connectWs() {
     if (stopped) return;
@@ -295,9 +296,37 @@ function startSyncEngine(db, onDataChanged) {
       if (hasConnectedBefore) reconcileTick(); // back online after a drop — verify, don't just assume the incremental pulls we missed will self-correct
       hasConnectedBefore = true;
     };
-    ws.onmessage = () => { pullTick(); }; // any event at all is worth an immediate catch-up pull
+    ws.onmessage = (msg) => {
+      let data;
+      try {
+        data = JSON.parse(msg.data);
+      } catch {
+        pullTick(); // unparseable — treat conservatively as "something happened"
+        return;
+      }
+      if (data && data.event === 'ping') {
+        // App-level heartbeat only (see backend realtime/consumers.py) --
+        // not a domain event. Reply so the server can tell this
+        // connection is actually alive, not just technically open, but
+        // don't waste a pull cycle on it -- previously EVERY message
+        // triggered pullTick(), so adding a periodic server heartbeat
+        // would otherwise have turned into a pull every ~30s regardless
+        // of whether anything actually changed.
+        try { ws.send(JSON.stringify({ type: 'pong' })); } catch {}
+        return;
+      }
+      // 'hello' (sent on every connect/reconnect) and any real domain
+      // event both land here -- both are worth an immediate catch-up
+      // pull. This deliberately does not try to be smarter than that
+      // (e.g. reading `sequence` to decide whether a pull is really
+      // needed): reconcileTick() on reconnect below is the actual
+      // safety net for anything missed outright, so a slightly
+      // over-eager pull here costs a bit of bandwidth, never correctness.
+      pullTick();
+    };
     ws.onclose = () => {
       if (stopped) return;
+      wsReconnectCount += 1;
       wsRetryTimer = setTimeout(connectWs, wsRetryDelay);
       wsRetryDelay = Math.min(wsRetryDelay * 2, 30_000);
     };
@@ -320,6 +349,7 @@ function startSyncEngine(db, onDataChanged) {
     // screenshot instead of guesswork — the sidebar shows this live.
     getStatus: () => ({
       liveConnected: !!ws && ws.readyState === WebSocket.OPEN,
+      liveReconnectCount: wsReconnectCount,
       lastPullAt: getLastPullAt(db),
       lastPushError: db.prepare(
         `SELECT last_error, client_timestamp FROM sync_queue WHERE status IN ('pending','failed') AND last_error IS NOT NULL ORDER BY client_timestamp DESC LIMIT 1`

@@ -72,6 +72,9 @@ function migrate(db) {
   if (!hasColumn('sales', 'customer_id')) {
     db.exec('ALTER TABLE sales ADD COLUMN customer_id TEXT REFERENCES customers(id)');
   }
+  if (!hasColumn('sale_items', 'stock_shortfall')) {
+    db.exec('ALTER TABLE sale_items ADD COLUMN stock_shortfall INTEGER NOT NULL DEFAULT 0');
+  }
 }
 
 /**
@@ -417,20 +420,42 @@ function applyPulledSaleItem(db, entityId, operation, payload) {
     db.prepare(`UPDATE sale_items SET is_deleted = 1, updated_at = ?, synced_at = ? WHERE id = ?`).run(ts, ts, entityId);
     return;
   }
-  if (db.prepare(`SELECT id FROM sale_items WHERE id = ?`).get(entityId)) return; // already applied — never re-deduct stock
+  if (db.prepare(`SELECT id FROM sale_items WHERE id = ?`).get(entityId)) {
+    // Already applied — never re-deduct stock for it. BUT stock_shortfall
+    // is purely informational (never touches quantity/stock), and the
+    // cloud's own independent allocation (sales/views.py's
+    // _allocate_stock, run with real cross-till knowledge via Postgres
+    // row locks) is the authoritative shortfall figure — more trustworthy
+    // than whatever this till guessed locally when it first created the
+    // row. Let that one authoritative number overwrite the local guess;
+    // nothing else about the row changes.
+    if (payload.stock_shortfall != null) {
+      db.prepare(`UPDATE sale_items SET stock_shortfall = ?, updated_at = ?, synced_at = ? WHERE id = ?`)
+        .run(payload.stock_shortfall, ts, ts, entityId);
+    }
+    return;
+  }
   if (!db.prepare(`SELECT id FROM sales WHERE id = ?`).get(payload.sale_id)) return; // sale header hasn't arrived yet — retry next pull
 
   db.prepare(
-    `INSERT INTO sale_items (id, sale_id, product_id, item_name, category, quantity, unit_price, unit_cost, discount, created_at, updated_at, is_deleted, synced_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
+    `INSERT INTO sale_items (id, sale_id, product_id, item_name, category, quantity, unit_price, unit_cost, discount, stock_shortfall, created_at, updated_at, is_deleted, synced_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
   ).run(entityId, payload.sale_id, payload.product_id || null, payload.item_name || '', payload.category || '',
-    payload.quantity || 1, payload.unit_price || 0, payload.unit_cost || 0, payload.discount || 0, ts, ts, ts);
+    payload.quantity || 1, payload.unit_price || 0, payload.unit_cost || 0, payload.discount || 0,
+    payload.stock_shortfall || 0, ts, ts, ts);
 
   // The one case pulling a sale item actually changes something besides
   // the sales tables: deduct THIS desktop's own local stock so it stays
-  // accurate for a sale that happened somewhere else entirely.
+  // accurate for a sale that happened somewhere else entirely. This can
+  // ALSO come up short (this till's own locally-known stock wasn't
+  // enough either) — if so, that's a SEPARATE local shortfall on top of
+  // whatever the cloud already recorded above, so add rather than
+  // overwrite it.
   if (payload.product_id) {
-    allocateStock(db, entityId, payload.product_id, payload.quantity || 1);
+    const { shortfall } = allocateStock(db, entityId, payload.product_id, payload.quantity || 1);
+    if (shortfall > 0) {
+      db.prepare(`UPDATE sale_items SET stock_shortfall = stock_shortfall + ? WHERE id = ?`).run(shortfall, entityId);
+    }
   }
 }
 
@@ -489,8 +514,18 @@ const createSale = (db) => db.transaction((input) => {
     ).run(itemId, saleId, item.product_id || null, item.item_name, item.category || '', item.quantity, item.unit_price, item.unit_cost || 0, item.discount || 0, ts, ts);
 
     if (item.product_id) {
-      const { unitCost } = allocateStock(db, itemId, item.product_id, item.quantity);
+      const { unitCost, shortfall } = allocateStock(db, itemId, item.product_id, item.quantity);
       if (unitCost) db.prepare(`UPDATE sale_items SET unit_cost = ? WHERE id = ?`).run(unitCost, itemId);
+      // shortfall > 0 means THIS till's own locally-known stock ran out
+      // mid-sale — e.g. another till (or the web) already sold what this
+      // till still believed was available, and that hasn't synced down
+      // yet. Recorded rather than discarded (as it silently was before)
+      // so the till itself flags it immediately, and so it survives the
+      // sync round-trip for the cloud/owner to see too — see the cloud's
+      // OWN independent allocation in sales/views.py's _allocate_stock,
+      // which is the authoritative check across every till, not just
+      // this one's local view.
+      if (shortfall > 0) db.prepare(`UPDATE sale_items SET stock_shortfall = ? WHERE id = ?`).run(shortfall, itemId);
     }
   }
 

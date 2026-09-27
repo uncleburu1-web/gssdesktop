@@ -205,6 +205,19 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
             <button className="btn ghost small" style={{ marginLeft: 10 }} onClick={() => setLastReceipt(null)}>Dismiss</button>
           </div>
         )}
+        {lastReceipt && lastReceipt.items.some((i) => i.stock_shortfall > 0) && (
+          // Surfaces the exact race this whole feature exists for: two
+          // tills (or a till and the web) both sold the last of
+          // something before either knew about the other's sale. This
+          // till's own local batches ran out mid-sale — the customer
+          // already has the item, so the sale still went through; this
+          // is purely so whoever's on this till finds out right now
+          // instead of only via a report days later.
+          <div className="form-error" style={{ background: 'rgba(232,162,60,.12)', borderColor: 'var(--warn)', color: 'var(--warn)' }}>
+            Sold more of an item than this till had tracked stock for — likely sold on another till or online
+            at nearly the same time. Flagged for the owner; no action needed here.
+          </div>
+        )}
 
         <div className="pos-grid">
           <button className="pos-tile custom" onClick={() => setCustomOpen(true)}>

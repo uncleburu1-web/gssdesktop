@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS sale_items (
   unit_price REAL NOT NULL,
   unit_cost REAL NOT NULL DEFAULT 0,
   discount REAL NOT NULL DEFAULT 0,
+  stock_shortfall INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   is_deleted INTEGER NOT NULL DEFAULT 0,
