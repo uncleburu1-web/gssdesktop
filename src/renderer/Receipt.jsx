@@ -1,4 +1,4 @@
-import { money, fmtDateTime } from './format.js';
+import { money, fmtDateTime, methodLabel } from './format.js';
 
 /**
  * Fallback shop details — used only if the logged-in account's profile
@@ -43,6 +43,9 @@ export default function Receipt({ sale, cashReceived, change, shop }) {
     logoUrl: shop?.shop_logo_url || '',
   };
   const isCash = sale.payment_method === 'cash';
+  // More than one payment row on a COMPLETED sale = a split payment.
+  const isSplit = (sale.payments || []).length > 1;
+  const splitCash = isSplit ? sale.payments.find((p) => p.method === 'cash') : null;
   const paymentLabel = sale.payment_method === 'pos'
     ? 'POS/Card'
     : sale.payment_method[0].toUpperCase() + sale.payment_method.slice(1);
@@ -75,8 +78,8 @@ export default function Receipt({ sale, cashReceived, change, shop }) {
 
       <div className="receipt-divider" />
       <div className="receipt-row">
-        <span>Invoice</span>
-        <span>{sale.invoice_number ? `#${sale.invoice_number}` : `#${(sale.id || '—').slice(0, 8).toUpperCase()}`}</span>
+        <span>{sale.receipt_no ? 'Receipt' : 'Invoice'}</span>
+        <span>{sale.receipt_no || (sale.invoice_number ? `#${sale.invoice_number}` : `#${(sale.id || '—').slice(0, 8).toUpperCase()}`)}</span>
       </div>
       <div className="receipt-row">
         <span>Date</span>
@@ -115,11 +118,29 @@ export default function Receipt({ sale, cashReceived, change, shop }) {
       </div>
 
       <div className="receipt-divider" />
-      <div className="receipt-row">
-        <span>Payment ({paymentLabel})</span>
-        <span>{money(sale.total)}</span>
-      </div>
-      {isCash && (
+      {isSplit ? (
+        // Several methods: one line per payment, and the change if any cash was handed over.
+        <>
+          {sale.payments.map((p) => (
+            <div className="receipt-row" key={p.id || `${p.method}-${p.amount}`}>
+              <span>{methodLabel(p.method)}{p.reference ? ` (${p.reference})` : ''}</span>
+              <span>{money(p.amount)}</span>
+            </div>
+          ))}
+          {splitCash && splitCash.tendered ? (
+            <>
+              <div className="receipt-row"><span>Cash received</span><span>{money(splitCash.tendered)}</span></div>
+              <div className="receipt-row"><span>Change</span><span>{money(splitCash.change_given)}</span></div>
+            </>
+          ) : null}
+        </>
+      ) : (
+        <div className="receipt-row">
+          <span>Payment ({paymentLabel})</span>
+          <span>{money(sale.total)}</span>
+        </div>
+      )}
+      {isCash && !isSplit && (
         <>
           <div className="receipt-row">
             <span>Received</span>

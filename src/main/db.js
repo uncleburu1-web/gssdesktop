@@ -1,4 +1,5 @@
 const Database = require('better-sqlite3');
+const { getOrCreateDeviceId } = require('./device');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -75,6 +76,15 @@ function migrate(db) {
   if (!hasColumn('sale_items', 'stock_shortfall')) {
     db.exec('ALTER TABLE sale_items ADD COLUMN stock_shortfall INTEGER NOT NULL DEFAULT 0');
   }
+
+  // Receipt numbers, shifts, split payments (all additive; safe to run on every open).
+  if (!hasColumn('sales', 'receipt_no')) db.exec('ALTER TABLE sales ADD COLUMN receipt_no TEXT');
+  if (!hasColumn('sales', 'shift_id')) db.exec('ALTER TABLE sales ADD COLUMN shift_id TEXT');
+  // Partial: sales from before receipt numbers (NULL) never collide with each other. Created here,
+  // not in schema.sql, for the same reason as idx_products_barcode above.
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_receipt_no ON sales(receipt_no) WHERE receipt_no IS NOT NULL');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sales_shift ON sales(shift_id)');
+  backfillPayments(db);
 }
 
 /**
@@ -192,6 +202,32 @@ function computeStockFields(db, productId) {
   return { quantity, cost_price: Math.round(costPrice * 100) / 100 };
 }
 
+/**
+ * Stock quantity and average cost for EVERY product in one query (computeStockFields does the
+ * same sums for one product and costs one query per call, which made the product list a query
+ * per product). The fold below is the same arithmetic in the same batch order as
+ * computeStockFields, so results are identical (test/perf.equivalence.test.js proves it).
+ */
+function stockFieldsForAllProducts(db) {
+  const batches = db.prepare(
+    // expiry_date, rowid: the order idx_batches_product (product_id, expiry_date) hands rows back
+    `SELECT product_id, quantity_remaining, cost_price FROM stock_batches WHERE is_deleted = 0 ORDER BY product_id, expiry_date, rowid`
+  ).all();
+  const byProduct = new Map();
+  for (const b of batches) {
+    let acc = byProduct.get(b.product_id);
+    if (!acc) { acc = { quantity: 0, totalQty: 0, weightedCost: 0 }; byProduct.set(b.product_id, acc); }
+    acc.quantity += b.quantity_remaining;
+    if (b.quantity_remaining > 0) { acc.totalQty += b.quantity_remaining; acc.weightedCost += b.quantity_remaining * b.cost_price; }
+  }
+  return (productId) => {
+    const acc = byProduct.get(productId);
+    if (!acc) return { quantity: 0, cost_price: 0 };
+    const costPrice = acc.totalQty ? acc.weightedCost / acc.totalQty : 0;
+    return { quantity: acc.quantity, cost_price: Math.round(costPrice * 100) / 100 };
+  };
+}
+
 function listProducts(db, { category = null, search = '' } = {}) {
   let rows = db.prepare(`SELECT * FROM products WHERE is_deleted = 0 ORDER BY name`).all();
   if (category && category !== 'all') rows = rows.filter((r) => r.category === category);
@@ -199,7 +235,8 @@ function listProducts(db, { category = null, search = '' } = {}) {
     const q = search.toLowerCase();
     rows = rows.filter((r) => `${r.name} ${r.short_code || ''} ${r.barcode || ''}`.toLowerCase().includes(q));
   }
-  return rows.map((r) => ({ ...r, ...computeStockFields(db, r.id) }));
+  const stockOf = stockFieldsForAllProducts(db);
+  return rows.map((r) => ({ ...r, ...stockOf(r.id) }));
 }
 
 function createCustomer(db, { name, phone = '', email = '', address = '', notes = '' }) {
@@ -227,15 +264,22 @@ function listCustomers(db, { search = '' } = {}) {
   // What each customer currently owes across their own not-yet-fully-paid
   // sales — computed locally so it works offline, same reasoning as
   // CustomerViewSet.balance on the cloud side (sales/../customers/views.py).
+  // All installment sales in one query, their items in a batched one, then grouped per customer
+  // (this used to run a query for every customer plus two for each of their open sales).
+  const open = db.prepare(
+    `SELECT * FROM sales WHERE status = 'outstanding' AND is_deleted = 0 AND customer_id IS NOT NULL ORDER BY rowid`
+  ).all();
+  const openItems = loadItemsBySale(db, open.map((s) => s.id));
+  const owed = new Map();
+  for (const s of open) {
+    const entry = owed.get(s.customer_id) || { balance: 0, count: 0 };
+    entry.balance += buildSale(s, openItems.get(s.id) || []).balance_due;
+    entry.count += 1;
+    owed.set(s.customer_id, entry);
+  }
   return rows.map((r) => {
-    const outstanding = db.prepare(
-      `SELECT amount_paid, id FROM sales WHERE customer_id = ? AND status = 'outstanding' AND is_deleted = 0`
-    ).all(r.id);
-    const balanceDue = outstanding.reduce((sum, s) => {
-      const sale = getSale(db, s.id);
-      return sum + (sale ? sale.balance_due : 0);
-    }, 0);
-    return { ...r, balance_due: balanceDue, outstanding_sale_count: outstanding.length };
+    const entry = owed.get(r.id);
+    return { ...r, balance_due: entry ? entry.balance : 0, outstanding_sale_count: entry ? entry.count : 0 };
   });
 }
 
@@ -318,6 +362,19 @@ function restoreStock(db, saleItemId) {
 //    updates the header fields, just never re-touches stock/allocations.
 // ---------------------------------------------------------------------
 
+/**
+ * True while THIS till has an edit of this exact row that the cloud has not
+ * acknowledged yet. A pull must not overwrite such a row: the pending push is
+ * what will bring the cloud up to date. (The old guard compared updated_at
+ * against `payload.updated_at`, a field the cloud never sends, so it never
+ * fired and every pull overwrote unpushed local edits.)
+ */
+function hasPendingLocalChange(db, entityType, entityId) {
+  return !!db.prepare(
+    `SELECT 1 FROM sync_queue WHERE entity_type = ? AND entity_id = ? AND status = 'pending' LIMIT 1`
+  ).get(entityType, entityId);
+}
+
 function applyPulledProduct(db, entityId, operation, payload) {
   const ts = nowIso();
   if (operation === 'delete') {
@@ -325,7 +382,7 @@ function applyPulledProduct(db, entityId, operation, payload) {
     return;
   }
   const existing = db.prepare(`SELECT updated_at FROM products WHERE id = ?`).get(entityId);
-  if (existing && existing.updated_at >= (payload.updated_at || ts)) return; // local edit is newer — keep it, next push wins
+  if (existing && hasPendingLocalChange(db, 'product', entityId)) return; // unpushed local edit — keep it, its push updates the cloud
   const fields = [payload.name, payload.short_code || '', payload.barcode || null, payload.category || 'other',
     payload.unit || 'PIECE', payload.sell_price || 0, payload.min_stock ?? 2];
   if (existing) {
@@ -347,19 +404,29 @@ function applyPulledStockBatch(db, entityId, operation, payload) {
     return;
   }
   if (!db.prepare(`SELECT id FROM products WHERE id = ?`).get(payload.product_id)) return; // product hasn't arrived yet — retry next pull
-  const existing = db.prepare(`SELECT updated_at FROM stock_batches WHERE id = ?`).get(entityId);
-  if (existing && existing.updated_at >= (payload.updated_at || ts)) return;
-  const fields = [payload.product_id, payload.batch_number || '', payload.quantity_received || 0,
-    payload.quantity_remaining || 0, payload.cost_price || 0, payload.expiry_date || null];
+  const existing = db.prepare(`SELECT quantity_received, quantity_remaining FROM stock_batches WHERE id = ?`).get(entityId);
+  if (existing && hasPendingLocalChange(db, 'stock_batch', entityId)) return; // this till created it and the cloud hasn't seen it yet
+
+  // A QUANTITY NEVER ARRIVES AS AN ABSOLUTE VALUE. The cloud's quantity_remaining already
+  // reflects sales this till has not pushed yet (and sales other tills made, which arrive
+  // separately as sale lines and are deducted by applyPulledSaleItem). Overwriting local stock
+  // with it silently erased offline sales or deducted sales twice. Instead:
+  //   - an EXISTING batch keeps its local quantity; if the cloud's quantity_received changed
+  //     (an owner's stock correction) the SAME delta is applied locally;
+  //   - a NEW batch starts at quantity_received, and the pulled sale lines that consumed it
+  //     deduct from it exactly once.
+  const received = payload.quantity_received || 0;
   if (existing) {
+    const delta = received - existing.quantity_received;
+    const remaining = Math.max(0, existing.quantity_remaining + delta);
     db.prepare(
       `UPDATE stock_batches SET product_id=?, batch_number=?, quantity_received=?, quantity_remaining=?, cost_price=?, expiry_date=?, updated_at=?, synced_at=? WHERE id=?`
-    ).run(...fields, ts, ts, entityId);
+    ).run(payload.product_id, payload.batch_number || '', received, remaining, payload.cost_price || 0, payload.expiry_date || null, ts, ts, entityId);
   } else {
     db.prepare(
       `INSERT INTO stock_batches (id, product_id, batch_number, quantity_received, quantity_remaining, cost_price, expiry_date, received_date, created_at, updated_at, is_deleted, synced_at)
        VALUES (?,?,?,?,?,?,?,?,?,?,0,?)`
-    ).run(entityId, ...fields, ts, ts, ts, ts);
+    ).run(entityId, payload.product_id, payload.batch_number || '', received, received, payload.cost_price || 0, payload.expiry_date || null, ts, ts, ts, ts);
   }
 }
 
@@ -370,7 +437,7 @@ function applyPulledCustomer(db, entityId, operation, payload) {
     return;
   }
   const existing = db.prepare(`SELECT updated_at FROM customers WHERE id = ?`).get(entityId);
-  if (existing && existing.updated_at >= (payload.updated_at || ts)) return;
+  if (existing && hasPendingLocalChange(db, 'customer', entityId)) return; // unpushed local edit — keep it
   const fields = [payload.name, payload.phone || '', payload.email || '', payload.address || '', payload.notes || ''];
   if (existing) {
     db.prepare(`UPDATE customers SET name=?, phone=?, email=?, address=?, notes=?, updated_at=?, synced_at=? WHERE id=?`)
@@ -405,10 +472,15 @@ function applyPulledSale(db, entityId, operation, payload) {
       `UPDATE sales SET customer_id=?, customer_name=?, staff_name=?, payment_method=?, status=?, amount_paid=?, invoice_number=?, updated_at=?, synced_at=? WHERE id=?`
     ).run(...fields, ts, ts, entityId);
   } else {
+    // receipt_no is only present once the cloud stores it (older clouds leave it out: NULL, which the
+    // unique index ignores). A receipt number already used by ANOTHER local sale is dropped rather than
+    // allowed to make the whole pull fail.
+    const receiptNo = payload.receipt_no && !db.prepare(`SELECT 1 FROM sales WHERE receipt_no = ?`).get(payload.receipt_no)
+      ? payload.receipt_no : null;
     db.prepare(
-      `INSERT INTO sales (id, invoice_number, customer_id, customer_name, staff_name, payment_method, status, amount_paid, date, created_at, updated_at, is_deleted, synced_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
-    ).run(entityId, payload.invoice_number ?? null, payload.customer_id || null, payload.customer_name || 'Walk-in',
+      `INSERT INTO sales (id, invoice_number, receipt_no, customer_id, customer_name, staff_name, payment_method, status, amount_paid, date, created_at, updated_at, is_deleted, synced_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
+    ).run(entityId, payload.invoice_number ?? null, receiptNo, payload.customer_id || null, payload.customer_name || 'Walk-in',
       payload.staff_name || '', payload.payment_method || 'cash', payload.status || 'completed', payload.amount_paid || 0,
       payload.date || ts, ts, ts, ts);
   }
@@ -479,15 +551,59 @@ function computeItemTotals(item) {
   return { subtotal, total, profit };
 }
 
-function getSale(db, saleId) {
-  const sale = db.prepare(`SELECT * FROM sales WHERE id = ?`).get(saleId);
-  if (!sale) return null;
-  const items = db.prepare(`SELECT * FROM sale_items WHERE sale_id = ? AND is_deleted = 0 ORDER BY rowid`).all(saleId);
+/**
+ * A sale row plus its live items -> the shape every caller receives. The ONE place totals, profit
+ * and balance are computed, shared by getSale (one sale) and the list functions (many sales), so
+ * a number can never differ depending on which screen you look at it from.
+ */
+function buildSale(sale, items, payments = []) {
   const itemsWithTotals = items.map((i) => ({ ...i, ...computeItemTotals(i) }));
   const total = itemsWithTotals.reduce((s, i) => s + i.total, 0);
   const profit = itemsWithTotals.reduce((s, i) => s + i.profit, 0);
   const balance_due = sale.status === 'completed' ? 0 : Math.max(total - sale.amount_paid, 0);
-  return { ...sale, items: itemsWithTotals, total: Math.round(total * 100) / 100, profit: Math.round(profit * 100) / 100, balance_due };
+  return { ...sale, items: itemsWithTotals, payments, total: Math.round(total * 100) / 100, profit: Math.round(profit * 100) / 100, balance_due };
+}
+
+function getSale(db, saleId) {
+  const sale = db.prepare(`SELECT * FROM sales WHERE id = ?`).get(saleId);
+  if (!sale) return null;
+  const items = db.prepare(`SELECT * FROM sale_items WHERE sale_id = ? AND is_deleted = 0 ORDER BY rowid`).all(saleId);
+  const payments = db.prepare(`SELECT * FROM sale_payments WHERE sale_id = ? AND is_deleted = 0 ORDER BY rowid`).all(saleId);
+  return buildSale(sale, items, payments);
+}
+
+/** Live payments for many sales at once (same batching as loadItemsBySale). */
+function loadPaymentsBySale(db, saleIds) {
+  const bySale = new Map();
+  for (let i = 0; i < saleIds.length; i += 500) {
+    const chunk = saleIds.slice(i, i + 500);
+    const rows = db.prepare(
+      `SELECT * FROM sale_payments WHERE is_deleted = 0 AND sale_id IN (${chunk.map(() => '?').join(',')}) ORDER BY rowid`
+    ).all(...chunk);
+    for (const row of rows) {
+      let list = bySale.get(row.sale_id);
+      if (!list) { list = []; bySale.set(row.sale_id, list); }
+      list.push(row);
+    }
+  }
+  return bySale;
+}
+
+/** Live items for many sales at once (one query per 500 sale ids; SQLite limits bound parameters). */
+function loadItemsBySale(db, saleIds) {
+  const bySale = new Map();
+  for (let i = 0; i < saleIds.length; i += 500) {
+    const chunk = saleIds.slice(i, i + 500);
+    const rows = db.prepare(
+      `SELECT * FROM sale_items WHERE is_deleted = 0 AND sale_id IN (${chunk.map(() => '?').join(',')}) ORDER BY rowid`
+    ).all(...chunk);
+    for (const row of rows) {
+      let list = bySale.get(row.sale_id);
+      if (!list) { list = []; bySale.set(row.sale_id, list); }
+      list.push(row);
+    }
+  }
+  return bySale;
 }
 
 /**
@@ -500,11 +616,16 @@ const createSale = (db) => db.transaction((input) => {
   const ts = nowIso();
   const status = input.status || 'completed';
   const invoiceNumber = nextInvoiceNumber(db);
+  // <till code>-<counter>: the counter never repeats on this till and the till code differs between
+  // tills, so two tills can never print the same receipt number (the plain invoice number restarts
+  // at 1 on every till, so those DO collide).
+  const receiptNo = `${deviceCode(db)}-${String(invoiceNumber).padStart(6, '0')}`;
+  const shift = input.cart_owner ? getOpenShift(db, input.cart_owner) : null;
 
   db.prepare(
-    `INSERT INTO sales (id, invoice_number, customer_id, customer_name, staff_name, payment_method, status, amount_paid, date, created_at, updated_at, is_deleted)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
-  ).run(saleId, invoiceNumber, input.customer_id || null, input.customer_name || 'Walk-in', input.staff_name || '', input.payment_method || 'cash', status, input.amount_paid || 0, ts, ts, ts);
+    `INSERT INTO sales (id, invoice_number, receipt_no, shift_id, customer_id, customer_name, staff_name, payment_method, status, amount_paid, date, created_at, updated_at, is_deleted)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+  ).run(saleId, invoiceNumber, receiptNo, shift ? shift.id : null, input.customer_id || null, input.customer_name || 'Walk-in', input.staff_name || '', input.payment_method || 'cash', status, 0, ts, ts, ts);
 
   for (const item of input.items) {
     const itemId = uuid();
@@ -529,10 +650,41 @@ const createSale = (db) => db.transaction((input) => {
     }
   }
 
-  const sale = getSale(db, saleId);
-  if (status === 'completed' && sale.amount_paid !== sale.total) {
-    db.prepare(`UPDATE sales SET amount_paid = ? WHERE id = ?`).run(sale.total, saleId);
+  // Payments are validated against the real total (known only now, after the items are in). Any
+  // problem throws, and the whole sale (items, stock, outbox rows) rolls back with it.
+  const total = getSale(db, saleId).total;
+  let payments;
+  if (Array.isArray(input.payments) && input.payments.length > 0) {
+    payments = input.payments.map(cleanPayment);
+    const entered = money2(payments.reduce((sum, p) => sum + p.amount, 0));
+    if (status === 'completed' && Math.abs(entered - total) > 0.005) {
+      throw new Error(`Payments must add up to the total (${total.toFixed(2)} due, ${entered.toFixed(2)} entered).`);
+    }
+    if (entered - total > 0.005) throw new Error(`Payments add up to more than the total (${total.toFixed(2)}).`);
+  } else {
+    // The ordinary one-method sale (and the installment deposit): one payment row.
+    const applied = status === 'completed' ? total : Math.min(money2(input.amount_paid || 0), total);
+    payments = applied > 0 ? [cleanPayment({ method: input.payment_method || 'cash', amount: applied })] : [];
   }
+  const amountPaid = money2(payments.reduce((sum, p) => sum + p.amount, 0));
+  const insertPayment = db.prepare(
+    `INSERT INTO sale_payments (id, sale_id, shift_id, method, amount, tendered, change_given, reference, paid_at, created_at, is_deleted)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+  );
+  for (const p of payments) {
+    insertPayment.run(uuid(), saleId, shift ? shift.id : null, p.method, p.amount, p.tendered, p.change_given, p.reference, ts, ts);
+  }
+  // The legacy single `payment_method` column (what the cloud, the web app and older reports read)
+  // holds the method that paid the MOST; the full breakdown lives in sale_payments.
+  const dominant = payments.length ? payments.reduce((a, b) => (b.amount > a.amount ? b : a)).method : (input.payment_method || 'cash');
+  const settled = total - amountPaid <= 0.005;
+  db.prepare(`UPDATE sales SET amount_paid = ?, payment_method = ?, status = ? WHERE id = ?`)
+    .run(amountPaid, dominant, settled ? 'completed' : status, saleId);
+
+  // The cart that produced this sale is no longer unfinished work. Cleared HERE, inside the sale's
+  // own transaction: a crash can never leave "sale recorded AND cart still offered", which would
+  // invite ringing the same customer up twice. (A failed sale rolls this back too, so the cart stays.)
+  if (input.cart_owner) db.prepare(`DELETE FROM carts WHERE id = ?`).run(draftId(input.cart_owner));
 
   const finalSale = getSale(db, saleId);
   enqueueSync(db, { entityType: 'sale', entityId: saleId, operation: 'create', payload: finalSale });
@@ -555,22 +707,50 @@ const deleteSale = (db) => db.transaction((saleId) => {
   return true;
 });
 
-const addPayment = (db) => db.transaction((saleId, amount) => {
+const addPayment = (db) => db.transaction((saleId, amount, opts = {}) => {
   const sale = getSale(db, saleId);
-  const newPaid = Math.min(sale.amount_paid + amount, sale.total);
-  const newStatus = newPaid >= sale.total ? 'completed' : sale.status;
+  if (!sale) throw new Error('That sale no longer exists.');
+  const balance = Math.max(money2(sale.total - sale.amount_paid), 0);
+  if (balance <= 0) throw new Error('This sale has nothing left to pay.');
+  // What is recorded is what was APPLIED to the debt, never more: paying 9,999 against a 500 balance
+  // is a 500 payment (the rest is change, not revenue).
+  const applied = money2(Math.min(Number(amount), balance));
+  if (!(applied > 0)) throw new Error('Enter an amount greater than zero.');
+  const payment = cleanPayment({ method: opts.method || sale.payment_method || 'cash', amount: applied, tendered: opts.tendered, reference: opts.reference });
+  const shift = opts.owner ? getOpenShift(db, opts.owner) : null;
+  const ts = nowIso();
+  db.prepare(
+    `INSERT INTO sale_payments (id, sale_id, shift_id, method, amount, tendered, change_given, reference, paid_at, created_at, is_deleted)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+  ).run(uuid(), saleId, shift ? shift.id : null, payment.method, payment.amount, payment.tendered, payment.change_given, payment.reference, ts, ts);
+  const newPaid = money2(sale.amount_paid + applied);
+  const newStatus = newPaid >= sale.total - 0.005 ? 'completed' : sale.status;
   db.prepare(`UPDATE sales SET amount_paid = ?, status = ?, updated_at = ? WHERE id = ?`)
-    .run(newPaid, newStatus, nowIso(), saleId);
+    .run(newPaid, newStatus, ts, saleId);
   const updated = getSale(db, saleId);
   enqueueSync(db, { entityType: 'sale', entityId: saleId, operation: 'update', payload: updated });
   return updated;
 });
 
-function listSales(db, { status = null } = {}) {
-  let rows = db.prepare(`SELECT id FROM sales WHERE is_deleted = 0 ORDER BY date DESC`).all();
-  let sales = rows.map((r) => getSale(db, r.id));
-  if (status) sales = sales.filter((s) => s.status === status);
-  return sales;
+/**
+ * Sales, newest first. `limit`/`offset` page through them (omit both for everything, as before).
+ * Used to load EVERY sale ever made and run two queries per sale before filtering by status in
+ * JavaScript, so the history screen got slower with every sale and froze the till after a while.
+ */
+function listSales(db, { status = null, limit = null, offset = 0 } = {}) {
+  const where = ['is_deleted = 0'];
+  const params = [];
+  if (status) { where.push('status = ?'); params.push(status); }
+  let sql = `SELECT * FROM sales WHERE ${where.join(' AND ')} ORDER BY date DESC, rowid DESC`;
+  if (limit != null) {
+    sql += ' LIMIT ? OFFSET ?';
+    params.push(Math.max(0, Math.floor(Number(limit)) || 0), Math.max(0, Math.floor(Number(offset)) || 0));
+  }
+  const sales = db.prepare(sql).all(...params);
+  const ids = sales.map((s) => s.id);
+  const items = loadItemsBySale(db, ids);
+  const payments = loadPaymentsBySale(db, ids);
+  return sales.map((s) => buildSale(s, items.get(s.id) || [], payments.get(s.id) || []));
 }
 
 /**
@@ -587,8 +767,273 @@ function listSales(db, { status = null } = {}) {
 function pruneSyncQueue(db) {
   const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(); // keep a day of history either way, for debugging
   db.prepare(`DELETE FROM sync_queue WHERE status = 'synced' AND client_timestamp < ?`).run(cutoff);
-  const failedCutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-  db.prepare(`DELETE FROM sync_queue WHERE status = 'failed' AND client_timestamp < ?`).run(failedCutoff);
+  // 'failed' rows are deliberately NEVER pruned: each one is a sale/stock change that exists on
+  // this till and nowhere else. Deleting them after a week silently destroyed the only copy of
+  // that fact. They stay (and stay visible) until someone retries them.
+}
+
+// ---------------------------------------------------------------------------------------------
+// Payments
+// ---------------------------------------------------------------------------------------------
+// The three methods the cloud already knows (sales.models.Sale.PAYMENT_CHOICES).
+const PAYMENT_METHODS = ['cash', 'transfer', 'pos'];
+
+/** Money to the kobo. Float dust (0.1 + 0.2) must never decide whether payments "add up". */
+const money2 = (n) => Math.round(Number(n) * 100) / 100;
+
+/** Short, readable code identifying THIS till on its receipts (first 6 hex digits of its permanent id). */
+function deviceCode(db) {
+  return getOrCreateDeviceId(db).replace(/-/g, '').slice(0, 6).toUpperCase();
+}
+
+/** One validated payment line. Throws a plain-English message the cashier can act on. */
+function cleanPayment(p) {
+  if (!p || !PAYMENT_METHODS.includes(p.method)) throw new Error('Choose a valid payment method (cash, transfer or card).');
+  const amount = money2(p.amount);
+  if (!Number.isFinite(amount) || amount <= 0) throw new Error('Each payment needs an amount greater than zero.');
+  let tendered = null;
+  let change = 0;
+  if (p.method === 'cash' && p.tendered !== undefined && p.tendered !== null && p.tendered !== '') {
+    tendered = money2(p.tendered);
+    if (!Number.isFinite(tendered) || tendered < amount) throw new Error('The cash handed over cannot be less than the amount paid in cash.');
+    change = money2(tendered - amount);
+  }
+  return { method: p.method, amount, tendered, change_given: change, reference: String(p.reference || '').trim().slice(0, 64) };
+}
+
+/**
+ * Sales that existed before payments did get one payment row (their old method + amount_paid), once.
+ * Runs on every open; the NOT EXISTS makes it a no-op afterwards.
+ */
+function backfillPayments(db) {
+  const rows = db.prepare(
+    `SELECT id, payment_method, amount_paid, date FROM sales
+     WHERE amount_paid > 0 AND NOT EXISTS (SELECT 1 FROM sale_payments p WHERE p.sale_id = sales.id)`
+  ).all();
+  if (rows.length === 0) return;
+  const insert = db.prepare(
+    `INSERT INTO sale_payments (id, sale_id, shift_id, method, amount, tendered, change_given, reference, paid_at, created_at, is_deleted)
+     VALUES (?, ?, NULL, ?, ?, NULL, 0, '', ?, ?, 0)`
+  );
+  db.transaction(() => {
+    for (const r of rows) {
+      insert.run(uuid(), r.id, PAYMENT_METHODS.includes(r.payment_method) ? r.payment_method : 'cash', r.amount_paid, r.date, nowIso());
+    }
+  })();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shifts and the Z-report. Local bookkeeping: nothing here is enqueued for sync (yet).
+// ---------------------------------------------------------------------------------------------
+function getOpenShift(db, owner) {
+  return db.prepare(`SELECT * FROM shifts WHERE owner = ? AND status = 'open'`).get(owner) || null;
+}
+
+function openShift(db, owner, openingFloat) {
+  const float = openingFloat === null || openingFloat === undefined || openingFloat === '' ? NaN : money2(openingFloat);
+  if (!Number.isFinite(float) || float < 0) throw new Error('Enter the opening cash float (zero or more).');
+  if (getOpenShift(db, owner)) throw new Error('You already have a shift open. Close it before opening another.');
+  const id = uuid();
+  db.prepare(`INSERT INTO shifts (id, owner, status, opened_at, opening_float) VALUES (?, ?, 'open', ?, ?)`).run(id, owner, nowIso(), float);
+  return db.prepare(`SELECT * FROM shifts WHERE id = ?`).get(id);
+}
+
+function addCashMovement(db, owner, { kind, amount, reason } = {}) {
+  const shift = getOpenShift(db, owner);
+  if (!shift) throw new Error('There is no open shift. Open one before moving cash in or out.');
+  if (kind !== 'paid_in' && kind !== 'paid_out') throw new Error('Unknown cash movement kind.');
+  const value = money2(amount);
+  if (!Number.isFinite(value) || value <= 0) throw new Error('Enter an amount greater than zero.');
+  if (!String(reason || '').trim()) throw new Error('Say why: a reason is required for every cash movement.');
+  const id = uuid();
+  db.prepare(`INSERT INTO cash_movements (id, shift_id, kind, amount, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(id, shift.id, kind, value, String(reason).trim(), nowIso());
+  return db.prepare(`SELECT * FROM cash_movements WHERE id = ?`).get(id);
+}
+
+/** The shift's numbers, computed from the books. Open shift = live (X-report); closed = frozen copy is used instead. */
+function computeShiftReport(db, shift) {
+  const sales = db.prepare(`SELECT * FROM sales WHERE shift_id = ? AND is_deleted = 0 ORDER BY date, rowid`).all(shift.id);
+  const items = loadItemsBySale(db, sales.map((s) => s.id));
+  const built = sales.map((s) => buildSale(s, items.get(s.id) || []));
+  const owing = built.filter((s) => s.status === 'outstanding');
+
+  // Payments taken DURING this shift, whenever the sale itself was made (an installment collected
+  // today belongs to today's drawer). Payments on deleted (voided) sales are excluded: that money went back.
+  const byMethod = { cash: 0, transfer: 0, pos: 0 };
+  for (const row of db.prepare(
+    `SELECT p.method AS method, SUM(p.amount) AS amount FROM sale_payments p JOIN sales s ON s.id = p.sale_id
+     WHERE p.shift_id = ? AND p.is_deleted = 0 AND s.is_deleted = 0 GROUP BY p.method`
+  ).all(shift.id)) byMethod[row.method] = money2(row.amount);
+
+  const movement = (kind) => money2(db.prepare(`SELECT COALESCE(SUM(amount), 0) AS n FROM cash_movements WHERE shift_id = ? AND kind = ?`).get(shift.id, kind).n);
+  const paidIn = movement('paid_in');
+  const paidOut = movement('paid_out');
+  const voided = db.prepare(`SELECT COUNT(*) AS n, COALESCE(SUM(amount_paid), 0) AS paid FROM sales WHERE shift_id = ? AND is_deleted = 1`).get(shift.id);
+
+  return {
+    shift: { id: shift.id, owner: shift.owner, status: shift.status, opened_at: shift.opened_at, closed_at: shift.closed_at, z_number: shift.z_number, notes: shift.notes || '' },
+    sales: {
+      count: built.length,
+      gross: money2(built.reduce((sum, s) => sum + s.total, 0)),
+      discounts: money2(built.reduce((sum, s) => sum + s.items.reduce((d, i) => d + Number(i.discount || 0), 0), 0)),
+    },
+    payments: { total: money2(byMethod.cash + byMethod.transfer + byMethod.pos), by_method: byMethod },
+    cash: {
+      opening_float: shift.opening_float,
+      cash_sales: byMethod.cash,
+      paid_in: paidIn,
+      paid_out: paidOut,
+      expected: money2(shift.opening_float + byMethod.cash + paidIn - paidOut),
+      counted: null,
+      variance: null,
+    },
+    voided: { count: voided.n, paid: money2(voided.paid) },
+    outstanding: { count: owing.length, balance: money2(owing.reduce((sum, s) => sum + s.balance_due, 0)) },
+    first_receipt: built.length ? built[0].receipt_no : null,
+    last_receipt: built.length ? built[built.length - 1].receipt_no : null,
+  };
+}
+
+/**
+ * Closes the cashier's shift. The cashier supplies what they COUNTED (they are not shown the expected
+ * figure first); the variance is computed here and recorded, never adjusted. The finished report is
+ * frozen: it is stored and returned verbatim from then on, so later edits can't rewrite history.
+ */
+function closeShift(db, owner, { countedCash, notes = '' } = {}) {
+  return db.transaction(() => {
+    const shift = getOpenShift(db, owner);
+    if (!shift) throw new Error('There is no open shift to close.');
+    const counted = countedCash === null || countedCash === undefined || countedCash === '' ? NaN : money2(countedCash);
+    if (!Number.isFinite(counted) || counted < 0) throw new Error('Enter the cash you counted in the drawer (zero or more).');
+
+    const closedAt = nowIso();
+    const nextZ = Number((db.prepare(`SELECT value FROM app_settings WHERE key = 'next_z_number'`).get() || { value: 1 }).value);
+    db.prepare(`INSERT INTO app_settings (key, value) VALUES ('next_z_number', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(String(nextZ + 1));
+
+    const report = computeShiftReport(db, { ...shift, status: 'closed', closed_at: closedAt, z_number: nextZ, notes: String(notes || '').trim() });
+    report.cash.counted = counted;
+    report.cash.variance = money2(counted - report.cash.expected);
+    const frozen = JSON.parse(JSON.stringify(report));
+    db.prepare(
+      `UPDATE shifts SET status = 'closed', closed_at = ?, counted_cash = ?, expected_cash = ?, variance = ?, z_number = ?, notes = ?, report_json = ? WHERE id = ?`
+    ).run(closedAt, counted, report.cash.expected, report.cash.variance, nextZ, frozen.shift.notes, JSON.stringify(frozen), shift.id);
+    return frozen;
+  })();
+}
+
+function getShiftReport(db, shiftId) {
+  const shift = db.prepare(`SELECT * FROM shifts WHERE id = ?`).get(shiftId);
+  if (!shift) return null;
+  if (shift.status === 'closed' && shift.report_json) return JSON.parse(shift.report_json);
+  return computeShiftReport(db, shift);
+}
+
+function listShifts(db, { owner = null, limit = 50 } = {}) {
+  const rows = owner
+    ? db.prepare(`SELECT id, owner, status, opened_at, closed_at, opening_float, counted_cash, expected_cash, variance, z_number FROM shifts WHERE owner = ? ORDER BY opened_at DESC LIMIT ?`).all(owner, limit)
+    : db.prepare(`SELECT id, owner, status, opened_at, closed_at, opening_float, counted_cash, expected_cash, variance, z_number FROM shifts ORDER BY opened_at DESC LIMIT ?`).all(limit);
+  return rows;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Unfinished carts (see the `carts` table). Local only: nothing here is ever enqueued for sync.
+// ---------------------------------------------------------------------------------------------
+const MAX_CART_LINES = 300;
+const MAX_CART_BYTES = 256 * 1024;
+const draftId = (owner) => `draft:${owner}`;
+
+function serializeCart(cart) {
+  const lines = Array.isArray(cart && cart.lines) ? cart.lines : [];
+  const json = JSON.stringify({
+    lines,
+    customer: (cart && cart.customer) || null,
+    customerName: (cart && cart.customerName) || '',
+  });
+  if (lines.length > MAX_CART_LINES || json.length > MAX_CART_BYTES) throw new Error('This cart is too large to save.');
+  return { lines, json };
+}
+
+function cartSummary(row) {
+  const cart = JSON.parse(row.cart_json);
+  return {
+    id: row.id,
+    label: row.label,
+    updated_at: row.updated_at,
+    item_count: cart.lines.reduce((n, l) => n + (Number(l.quantity) || 0), 0),
+    total: cart.lines.reduce((sum, l) => sum + (Number(l.quantity) || 0) * (Number(l.unit_price) || 0), 0),
+  };
+}
+
+/** Saves (or, if the cart is empty, removes) the cashier's active cart. Cheap enough to call on every change. */
+function saveDraft(db, owner, cart) {
+  const { lines, json } = serializeCart(cart);
+  if (lines.length === 0) {
+    db.prepare(`DELETE FROM carts WHERE id = ?`).run(draftId(owner));
+    return { saved: false };
+  }
+  db.prepare(
+    `INSERT INTO carts (id, owner, status, label, cart_json, updated_at) VALUES (?, ?, 'draft', '', ?, ?)
+     ON CONFLICT(id) DO UPDATE SET cart_json = excluded.cart_json, updated_at = excluded.updated_at`
+  ).run(draftId(owner), owner, json, nowIso());
+  return { saved: true };
+}
+
+function loadDraft(db, owner) {
+  const row = db.prepare(`SELECT cart_json FROM carts WHERE id = ?`).get(draftId(owner));
+  return row ? JSON.parse(row.cart_json) : null;
+}
+
+/** Sets the cart aside to serve someone else. Atomic: it is never in both places, or neither. */
+function parkCart(db, owner, cart, label = '') {
+  return db.transaction(() => {
+    const { lines, json } = serializeCart(cart);
+    if (lines.length === 0) throw new Error('There is nothing in the cart to park.');
+    const id = uuid();
+    const ts = nowIso();
+    const first = lines[0];
+    const autoLabel = label || `${first.item_name || 'Cart'}${lines.length > 1 ? ` +${lines.length - 1} more` : ''}`;
+    db.prepare(`INSERT INTO carts (id, owner, status, label, cart_json, updated_at) VALUES (?, ?, 'parked', ?, ?, ?)`).run(id, owner, autoLabel, json, ts);
+    db.prepare(`DELETE FROM carts WHERE id = ?`).run(draftId(owner));
+    return cartSummary({ id, label: autoLabel, cart_json: json, updated_at: ts });
+  })();
+}
+
+function listParked(db, owner) {
+  return db.prepare(`SELECT * FROM carts WHERE owner = ? AND status = 'parked' ORDER BY updated_at DESC`).all(owner).map(cartSummary);
+}
+
+/**
+ * Brings a parked cart back as the active one. If a cart is ALREADY active it is parked first,
+ * in the same transaction, so swapping between customers can never destroy someone's cart.
+ */
+function resumeParked(db, owner, id) {
+  return db.transaction(() => {
+    const row = db.prepare(`SELECT * FROM carts WHERE id = ? AND owner = ? AND status = 'parked'`).get(id, owner);
+    if (!row) throw new Error('That parked cart no longer exists.');
+    const current = loadDraft(db, owner);
+    db.prepare(`DELETE FROM carts WHERE id = ?`).run(id);
+    if (current && current.lines.length > 0) parkCart(db, owner, current);   // nested: becomes a savepoint
+    const cart = JSON.parse(row.cart_json);
+    saveDraft(db, owner, cart);
+    return cart;
+  })();
+}
+
+function discardParked(db, owner, id) {
+  return db.prepare(`DELETE FROM carts WHERE id = ? AND owner = ? AND status = 'parked'`).run(id, owner).changes;
+}
+
+function getSyncQueueStats(db) {
+  const count = (status) => db.prepare(`SELECT COUNT(*) AS n FROM sync_queue WHERE status = ?`).get(status).n;
+  return { pending: count('pending'), failed: count('failed') };
+}
+
+/** Puts every failed row back in line (fresh attempt counter, no backoff). Returns how many. */
+function retryFailedSync(db) {
+  return db.prepare(
+    `UPDATE sync_queue SET status = 'pending', retry_count = 0, next_attempt_at = NULL WHERE status = 'failed'`
+  ).run().changes;
 }
 
 /**
@@ -650,5 +1095,19 @@ module.exports = {
   getSetting,
   setSetting,
   pruneSyncQueue,
+  openShift,
+  getOpenShift,
+  addCashMovement,
+  closeShift,
+  getShiftReport,
+  listShifts,
+  saveDraft,
+  loadDraft,
+  parkCart,
+  listParked,
+  resumeParked,
+  discardParked,
+  getSyncQueueStats,
+  retryFailedSync,
   reconcileUnsyncedRows,
 };

@@ -31,3 +31,13 @@ export function posErrorMessage(err, fallback) {
   const match = raw.match(/Error:\s*(.+)$/);
   return (match ? match[1] : raw) || fallback;
 }
+
+const METHOD_LABELS = { cash: 'Cash', transfer: 'Transfer', pos: 'POS/Card' };
+export function methodLabel(method) {
+  return METHOD_LABELS[method] || (method ? method[0].toUpperCase() + method.slice(1) : '');
+}
+
+/** "Cash ₦300 · Transfer ₦500": how a sale was paid, shown wherever more than one method was used. */
+export function paymentsSummary(payments) {
+  return (payments || []).map((p) => `${methodLabel(p.method)} ${money(p.amount)}`).join(' · ');
+}

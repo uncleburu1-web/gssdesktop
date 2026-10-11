@@ -6,6 +6,7 @@ import ProductsScreen from './ProductsScreen.jsx';
 import CustomersScreen from './CustomersScreen.jsx';
 import SalesHistoryScreen from './SalesHistoryScreen.jsx';
 import PrinterSettingsScreen from './PrinterSettingsScreen.jsx';
+import ShiftScreen from './ShiftScreen.jsx';
 import { Icons } from './Icons.jsx';
 import { fmtRelative } from './format.js';
 
@@ -17,6 +18,23 @@ function Shell() {
   const [pendingSync, setPendingSync] = useState(0);
   const [syncStatus, setSyncStatus] = useState(null);
   const { theme, toggleTheme } = useTheme();
+
+  // What the sidebar tells the cashier about getting data to the cloud. "All changes synced" must
+  // only ever appear when NOTHING is pending AND NOTHING has failed; before, failed changes were
+  // not counted at all, so a rejected sale still read "All changes synced".
+  const failedSync = syncStatus?.queue?.failed ?? 0;
+  const waitingSync = syncStatus?.queue?.pending ?? pendingSync;
+  const cloudNote = {
+    offline: 'Offline. Sales are saved on this till and upload automatically when internet returns.',
+    degraded: 'The cloud is having trouble. Retrying automatically.',
+    auth_required: syncStatus?.cloudSync?.message,
+    unsupported: 'Cloud update pending. Your data is safe on this till.',
+  }[syncStatus?.cloudSync?.state];
+  const retryFailed = async () => {
+    await window.pos.retryFailedSync();
+    window.pos.syncStatus().then(setSyncStatus);
+    window.pos.pendingSyncCount().then(setPendingSync);
+  };
 
   useEffect(() => {
     window.pos.isLoggedIn().then(setLoggedIn);
@@ -104,11 +122,27 @@ function Shell() {
         <NavButton active={view === 'products'} onClick={() => setView('products')}>Products</NavButton>
         <NavButton active={view === 'customers'} onClick={() => setView('customers')}>Customers</NavButton>
         <NavButton active={view === 'history'} onClick={() => setView('history')}>Sales history</NavButton>
+        <NavButton active={view === 'shift'} onClick={() => setView('shift')}>Shift</NavButton>
         <NavButton active={view === 'printer'} onClick={() => setView('printer')}>Printer</NavButton>
         <div style={{ flex: 1 }} />
         <div style={{ fontSize: 11.5, color: 'var(--text-dim)', padding: '0 6px', marginBottom: 4 }}>
-          {pendingSync > 0 ? `${pendingSync} change${pendingSync > 1 ? 's' : ''} waiting to sync` : 'All changes synced'}
+          {waitingSync > 0
+            ? `${waitingSync} change${waitingSync > 1 ? 's' : ''} waiting to sync`
+            : failedSync > 0 ? '' : 'All changes synced'}
         </div>
+        {failedSync > 0 && (
+          <button
+            className="btn ghost small"
+            style={{ margin: '0 6px 6px', color: 'var(--danger)', justifyContent: 'center', textAlign: 'center', whiteSpace: 'normal' }}
+            title={syncStatus?.lastPushError?.last_error ? `Reason: ${syncStatus.lastPushError.last_error}` : undefined}
+            onClick={retryFailed}
+          >
+            {failedSync} change{failedSync > 1 ? 's' : ''} could not sync. Tap to retry
+          </button>
+        )}
+        {cloudNote && (
+          <div style={{ fontSize: 11, color: 'var(--danger)', padding: '0 6px', marginBottom: 6 }}>{cloudNote}</div>
+        )}
         <div
           style={{ fontSize: 11, color: 'var(--text-dim)', padding: '0 6px', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 6 }}
           title={syncStatus?.lastPushError ? `Last error: ${syncStatus.lastPushError.last_error}` : undefined}
@@ -143,6 +177,7 @@ function Shell() {
         {view === 'products' && <ProductsScreen refreshKey={saleTick} isOwner={isOwner} profile={profile} />}
         {view === 'customers' && <CustomersScreen refreshKey={saleTick} />}
         {view === 'history' && <SalesHistoryScreen refreshKey={saleTick} />}
+        {view === 'shift' && <ShiftScreen refreshKey={saleTick} profile={profile} />}
         {view === 'printer' && <PrinterSettingsScreen profile={profile} />}
       </div>
     </div>
