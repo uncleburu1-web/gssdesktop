@@ -84,6 +84,10 @@ function migrate(db) {
   // not in schema.sql, for the same reason as idx_products_barcode above.
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_receipt_no ON sales(receipt_no) WHERE receipt_no IS NOT NULL');
   db.exec('CREATE INDEX IF NOT EXISTS idx_sales_shift ON sales(shift_id)');
+  // Outbox attribution and acknowledgement (Stage 1). Additive only: old rows keep NULLs.
+  for (const column of ['device_id', 'actor', 'last_attempt_at', 'acked_at']) {
+    if (!hasColumn('sync_queue', column)) db.exec(`ALTER TABLE sync_queue ADD COLUMN ${column} TEXT`);
+  }
   backfillPayments(db);
 }
 
@@ -154,9 +158,16 @@ function setSetting(db, key, value) {
  */
 function enqueueSync(db, { entityType, entityId, operation, payload }) {
   db.prepare(
-    `INSERT INTO sync_queue (id, entity_type, entity_id, operation, payload, client_timestamp, status, retry_count)
-     VALUES (?, ?, ?, ?, ?, ?, 'pending', 0)`
-  ).run(uuid(), entityType, entityId, operation, JSON.stringify(payload), nowIso());
+    `INSERT INTO sync_queue (id, entity_type, entity_id, operation, payload, client_timestamp, status, retry_count, device_id, actor)
+     VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)`
+  ).run(uuid(), entityType, entityId, operation, JSON.stringify(payload), nowIso(), getOrCreateDeviceId(db), currentActor(db));
+}
+
+/** Username of whoever is signed in on this till right now (auth.js keeps it in app_settings), or null. */
+function currentActor(db) {
+  const row = db.prepare(`SELECT value FROM app_settings WHERE key = 'user_profile'`).get();
+  if (!row) return null;
+  try { return JSON.parse(row.value).username || null; } catch { return null; }
 }
 
 // ---------------------------------------------------------------------
@@ -1030,11 +1041,21 @@ function getSyncQueueStats(db) {
 }
 
 /** Puts every failed row back in line (fresh attempt counter, no backoff). Returns how many. */
-function retryFailedSync(db) {
+// The cloud's answer when an operation id it has already recorded comes back with different
+// content (sync/views.py _REUSED_ID_ERROR). Resending the same id can never succeed, so a retry
+// gives such a row a fresh id. That is safe: the cloud upserts by the entity's own id, so the
+// entity is still never created twice.
+const REUSED_ID_MARKER = 'already used for different content';
+
+const retryFailedSync = (db) => db.transaction(() => {
+  const reused = db.prepare(`SELECT id FROM sync_queue WHERE status = 'failed' AND last_error LIKE ?`)
+    .all(`%${REUSED_ID_MARKER}%`);
+  const rename = db.prepare(`UPDATE sync_queue SET id = ? WHERE id = ?`);
+  for (const row of reused) rename.run(uuid(), row.id);
   return db.prepare(
     `UPDATE sync_queue SET status = 'pending', retry_count = 0, next_attempt_at = NULL WHERE status = 'failed'`
   ).run().changes;
-}
+})();
 
 /**
  * Catches the actual root cause of "some products never reached the

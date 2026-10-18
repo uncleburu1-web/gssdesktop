@@ -196,7 +196,11 @@ CREATE TABLE IF NOT EXISTS sync_queue (
   status TEXT NOT NULL DEFAULT 'pending',  -- 'pending' | 'synced' | 'failed'
   retry_count INTEGER NOT NULL DEFAULT 0,
   next_attempt_at TEXT,            -- exponential backoff after a failed attempt; NULL = eligible now
-  last_error TEXT
+  last_error TEXT,
+  device_id TEXT,                  -- which till queued it (app_settings.device_id); NULL on rows older than this column
+  actor TEXT,                      -- username signed in when it was queued; NULL if nobody was (startup reconcile)
+  last_attempt_at TEXT,            -- last time the cloud ANSWERED for this row (no answer = offline, not an attempt)
+  acked_at TEXT                    -- when the cloud confirmed it (applied / already_applied)
 );
 CREATE INDEX IF NOT EXISTS idx_sync_queue_status ON sync_queue(status, client_timestamp);
 -- applyPulled* asks "does THIS till still have an unpushed edit of this exact row?" for every

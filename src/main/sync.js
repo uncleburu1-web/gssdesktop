@@ -1,7 +1,9 @@
 const { getAccessToken, refreshSession } = require('./auth');
 const {
   applyPulledOperation, getLastPullAt, setLastPullAt, pruneSyncQueue, reconcileUnsyncedRows, getSyncQueueStats,
+  getSetting, setSetting,
 } = require('./db');
+const { getOrCreateDeviceId } = require('./device');
 
 const API_BASE = process.env.BENCHLINE_API_URL || 'http://localhost:8000/api';
 const SYNC_INTERVAL_MS = 15_000;
@@ -37,6 +39,12 @@ function wsUrl(token) {
   const wsBase = httpBase.replace(/^http/, 'ws');
   return `${wsBase}/ws/live/?token=${encodeURIComponent(token)}`;
 }
+
+// Sent on every sync call so the cloud scopes it to the branch this till is PAIRED to (not to
+// whatever the signed-in account would resolve to on its own: a CEO with several branches has no
+// single branch, and every push used to be refused).
+const DEVICE_HEADER = 'X-Device-ID';
+const REMOVED_MESSAGE = 'This till was removed from the shop. Sign in again to pair it.';
 
 const isTimeout = (err) => !!err && (err.name === 'TimeoutError' || err.name === 'AbortError');
 
@@ -89,11 +97,16 @@ function startSyncEngine(db, onDataChanged) {
   let pullFailureCount = 0;
   let lastPullSkipped = 0;
   let pullDebounceTimer = null;
+  const deviceId = getOrCreateDeviceId(db);
+  // Pulls overlap the previous one by a couple of minutes (the cloud's next_since), so the same
+  // row can arrive twice. Applying it again is harmless, but this remembers what was applied at
+  // which updated_at so an unchanged row is not re-applied (or re-announced to the screens).
+  const appliedInOverlap = new Map(); // `${entity_type}:${entity_id}` -> updated_at
 
   async function doPush(token, operations) {
     return fetch(`${API_BASE}/sync/push/`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, [DEVICE_HEADER]: deviceId },
       body: JSON.stringify({ operations }),
       signal: AbortSignal.timeout(10_000),
     });
@@ -101,30 +114,33 @@ function startSyncEngine(db, onDataChanged) {
 
   // Rows the server answered badly for (5xx, 429, unreadable body): a COUNTED attempt with backoff.
   const countFailure = db.transaction((rows, message) => {
+    const now = new Date().toISOString();
     for (const row of rows) {
       const nextRetryCount = row.retry_count + 1;
-      db.prepare(`UPDATE sync_queue SET retry_count = ?, last_error = ?, next_attempt_at = ? WHERE id = ?`)
-        .run(nextRetryCount, message, new Date(Date.now() + backoffMs(nextRetryCount)).toISOString(), row.id);
+      db.prepare(`UPDATE sync_queue SET retry_count = ?, last_error = ?, next_attempt_at = ?, last_attempt_at = ? WHERE id = ?`)
+        .run(nextRetryCount, message, new Date(Date.now() + backoffMs(nextRetryCount)).toISOString(), now, row.id);
     }
   });
 
   const applyOutcomes = db.transaction((rows, byId) => {
+    const now = new Date().toISOString();
     for (const row of rows) {
       const outcome = byId.get(row.id);
       const status = outcome && outcome.status;
       if (status === 'applied' || status === 'already_applied') {
-        db.prepare(`UPDATE sync_queue SET status = 'synced', next_attempt_at = NULL, last_error = NULL WHERE id = ?`).run(row.id);
+        db.prepare(`UPDATE sync_queue SET status = 'synced', next_attempt_at = NULL, last_error = NULL, last_attempt_at = ?, acked_at = ? WHERE id = ?`)
+          .run(now, now, row.id);
       } else if (status === 'rejected') {
         const why = (outcome.error && String(outcome.error)) || 'rejected by server';
         console.error(`[sync] rejected ${row.entity_type} ${row.entity_id}: ${why}`);
-        db.prepare(`UPDATE sync_queue SET status = 'failed', last_error = ? WHERE id = ?`).run(why, row.id);
+        db.prepare(`UPDATE sync_queue SET status = 'failed', last_error = ?, last_attempt_at = ? WHERE id = ?`).run(why, now, row.id);
       } else {
         // Left out of `results` (or a status we don't know): the server is waiting on something
         // this op depends on. Back off so the rows BEHIND it get their turn, but never fail it.
         const nextRetryCount = row.retry_count + 1;
-        db.prepare(`UPDATE sync_queue SET retry_count = ?, last_error = ?, next_attempt_at = ? WHERE id = ?`)
+        db.prepare(`UPDATE sync_queue SET retry_count = ?, last_error = ?, next_attempt_at = ?, last_attempt_at = ? WHERE id = ?`)
           .run(nextRetryCount, 'waiting for a related record to sync first',
-            new Date(Date.now() + backoffMs(nextRetryCount)).toISOString(), row.id);
+            new Date(Date.now() + backoffMs(nextRetryCount)).toISOString(), now, row.id);
       }
     }
   });
@@ -176,6 +192,12 @@ function startSyncEngine(db, onDataChanged) {
       return 'stop';
     }
 
+    if (res.status === 410) {
+      // This till was unpaired in Settings -> Devices. Nothing is the rows' fault: keep them all
+      // (they upload once someone signs in again and re-pairs the till) and burn no retries.
+      setCloud('auth_required', REMOVED_MESSAGE);
+      return 'stop';
+    }
     if (res.status === 404 || res.status === 405) {
       // The cloud hasn't been updated to this version yet. Keep everything, burn nothing.
       setCloud('unsupported', 'The cloud has not been updated for this version yet.');
@@ -228,6 +250,8 @@ function startSyncEngine(db, onDataChanged) {
   // ---- pull ------------------------------------------------------------------------------
   const tick = () => new Promise((resolve) => setImmediate(resolve));
 
+  const overlapKey = (op) => `${op.entity_type}:${op.entity_id}`;
+
   function applyChunk(chunk, skipped) {
     db.transaction(() => {
       for (const op of chunk) {
@@ -237,6 +261,7 @@ function startSyncEngine(db, onDataChanged) {
         try {
           applyPulledOperation(db, op.entity_type, op.operation, op.payload);
           db.exec('RELEASE pull_op');
+          if (op.updated_at) appliedInOverlap.set(overlapKey(op), op.updated_at);
         } catch (err) {
           db.exec('ROLLBACK TO pull_op');
           db.exec('RELEASE pull_op');
@@ -255,7 +280,10 @@ function startSyncEngine(db, onDataChanged) {
     const url = since
       ? `${API_BASE}/sync/pull/?since=${encodeURIComponent(since)}`
       : `${API_BASE}/sync/pull/`;
-    const fetchPull = (t) => fetch(url, { headers: { Authorization: `Bearer ${t}` }, signal: AbortSignal.timeout(15_000) });
+    const fetchPull = (t) => fetch(url, {
+      headers: { Authorization: `Bearer ${t}`, [DEVICE_HEADER]: deviceId },
+      signal: AbortSignal.timeout(15_000),
+    });
 
     let res;
     try {
@@ -275,6 +303,7 @@ function startSyncEngine(db, onDataChanged) {
       console.error(`[sync] pull could not reach the cloud (attempt ${pullFailureCount}): ${String((err && err.message) || err)}`);
       return;
     }
+    if (res.status === 410) { setCloud('auth_required', REMOVED_MESSAGE); return; }
     if (!res.ok) {
       pullFailureCount += 1;
       console.error(`[sync] pull failed (attempt ${pullFailureCount}): sync pull responded ${res.status}`);
@@ -292,7 +321,11 @@ function startSyncEngine(db, onDataChanged) {
     // push whatever queued up meanwhile right now instead of waiting for the next tick.
     if (cloud.state === 'offline') { setCloud('ok'); setImmediate(() => pushNow()); }
 
-    const operations = body.operations || [];
+    // Rows already applied at this exact version during the previous (overlapping) pull are
+    // dropped here; anything new or changed since goes through as before.
+    const operations = (body.operations || []).filter(
+      (op) => !(op.updated_at && appliedInOverlap.get(overlapKey(op)) === op.updated_at)
+    );
     if (operations.length > 0) {
       // Applied in small chunks, yielding between them: better-sqlite3 is synchronous and shares
       // the main thread with every IPC call, so one giant transaction would freeze the till.
@@ -308,8 +341,16 @@ function startSyncEngine(db, onDataChanged) {
       onDataChanged?.(operations);
     }
     // Cursor from the SERVER's clock, not this machine's — avoids ever
-    // missing a change because of clock skew between two computers.
-    setLastPullAt(db, body.server_time || new Date().toISOString());
+    // missing a change because of clock skew between two computers. A cloud that sends next_since
+    // has already moved it back behind its read, so a row committed while this pull was reading
+    // comes back next time instead of being skipped forever (G4). Older clouds: server_time.
+    const cursor = body.next_since || body.server_time || new Date().toISOString();
+    setLastPullAt(db, cursor);
+    // What the sidebar shows as "last update from cloud": when this pull happened, not the cursor.
+    setSetting(db, 'last_pull_completed_at', body.server_time || new Date().toISOString());
+    for (const [key, updatedAt] of appliedInOverlap) {
+      if (Date.parse(updatedAt) <= Date.parse(cursor)) appliedInOverlap.delete(key); // cannot come back: the next pull starts after it
+    }
     pullFailureCount = 0;
   }
 
@@ -385,7 +426,7 @@ function startSyncEngine(db, onDataChanged) {
     let remoteCounts;
     try {
       const res = await fetch(`${API_BASE}/sync/reconcile/`, {
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { Authorization: `Bearer ${token}`, [DEVICE_HEADER]: deviceId },
         signal: AbortSignal.timeout(10_000),
       });
       if (!res.ok) return; // read-only health check — just try again next scheduled reconcile
@@ -515,7 +556,7 @@ function startSyncEngine(db, onDataChanged) {
     getStatus: () => ({
       liveConnected: !!ws && ws.readyState === WebSocket.OPEN,
       liveReconnectCount: wsReconnectCount,
-      lastPullAt: getLastPullAt(db),
+      lastPullAt: getSetting(db, 'last_pull_completed_at') || getLastPullAt(db),
       // What the cashier/owner actually needs to know about getting data to the cloud — kept
       // separate from `liveConnected` (the WebSocket), which says nothing about whether
       // uploads are working.

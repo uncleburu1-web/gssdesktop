@@ -57,6 +57,7 @@ const queueCount = (db, status) => db.prepare(`SELECT COUNT(*) AS n FROM sync_qu
 class FakeCloud {
   constructor() {
     this.pushRequests = [];          // arrays of operation ids, one entry per POST
+    this.requests = [];              // every call: { url, headers }
     this.authHeaders = [];
     this.pushInFlight = 0; this.maxPushInFlight = 0;
     this.pullInFlight = 0; this.maxPullInFlight = 0; this.pullCount = 0;
@@ -78,6 +79,7 @@ class FakeCloud {
   install() { globalThis.fetch = (url, init) => this._handle(String(url), init || {}); return this; }
   _json(body, status = 200) { return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } }); }
   async _handle(url, init) {
+    this.requests.push({ url, headers: { ...(init.headers || {}) } });
     if (this.networkDown) throw new TypeError('fetch failed');
     if (this.delayMs) await sleep(this.delayMs);
     if (url.endsWith('/sync/push/')) {
@@ -96,7 +98,11 @@ class FakeCloud {
     if (url.endsWith('/auth/refresh/')) return this._json(this.refreshBody, this.refreshStatus);
     if (url.includes('/sync/pull/')) {
       this.pullCount += 1; this.pullInFlight += 1; this.maxPullInFlight = Math.max(this.maxPullInFlight, this.pullInFlight);
-      try { if (this.pullDelayMs) await sleep(this.pullDelayMs); return this._json(this.pullBody); }
+      try {
+        if (this.pullDelayMs) await sleep(this.pullDelayMs);
+        if (this.pullHttpStatus && this.pullHttpStatus !== 200) return this._json({ detail: 'nope' }, this.pullHttpStatus);
+        return this._json(typeof this.pullBody === 'function' ? this.pullBody(url) : this.pullBody);
+      }
       finally { this.pullInFlight -= 1; }
     }
     if (url.endsWith('/sync/reconcile/')) return this._json({ counts: {} });

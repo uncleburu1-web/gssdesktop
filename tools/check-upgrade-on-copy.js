@@ -42,8 +42,13 @@ const snapshot = (db) => ({
   invoices: one(db, `SELECT COALESCE(MAX(invoice_number), 0) AS n FROM sales`),
 });
 
+// Fingerprint of every queued change: id + what it says. The upgrade must not alter a single one.
+const queueFingerprint = (db) => db.prepare(`SELECT id, entity_type, entity_id, operation, payload, status FROM sync_queue ORDER BY id`).all()
+  .map((r) => JSON.stringify(r)).join('\n');
+
 const raw = new Database(copy);
 const before = snapshot(raw);
+const queueBefore = queueFingerprint(raw);
 raw.close();
 
 const dbm = require('../src/main/db');
@@ -72,6 +77,9 @@ const probe = db.prepare(`SELECT COUNT(*) AS n FROM sales s WHERE s.amount_paid 
 check(probe === 0, 'no paid sale is missing its payment record');
 const mismatched = db.prepare(`SELECT COUNT(*) AS n FROM sale_payments p JOIN sales s ON s.id = p.sale_id WHERE p.method != s.payment_method`).get().n;
 check(mismatched === 0, 'each payment kept its sale\'s original payment method');
+const queueCols = db.prepare(`PRAGMA table_info(sync_queue)`).all().map((c) => c.name);
+check(['device_id', 'actor', 'last_attempt_at', 'acked_at'].every((c) => queueCols.includes(c)), 'new outbox columns exist on the sync queue');
+check(queueFingerprint(db) === queueBefore, 'every queued change kept its id and content (so the cloud still recognises retries)');
 check(db.prepare(`PRAGMA integrity_check`).get().integrity_check === 'ok', 'the database passes SQLite\'s own integrity check');
 
 console.log(`\nUpgrade took ${took} ms.`);
