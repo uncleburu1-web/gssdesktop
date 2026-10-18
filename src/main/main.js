@@ -71,8 +71,36 @@ app.whenReady().then(() => {
     syncEngine.pushNow();
     return result;
   });
+  // Unfinished carts belong to whoever is logged in on this till; the renderer never names the owner.
+  const cartOwner = () => auth.getUserProfile(database).username || '';
+  ipcMain.handle('pos:saveDraft', (_e, cart) => db.saveDraft(database, cartOwner(), cart));
+  ipcMain.handle('pos:loadDraft', () => db.loadDraft(database, cartOwner()));
+  ipcMain.handle('pos:parkCart', (_e, cart) => db.parkCart(database, cartOwner(), cart));
+  ipcMain.handle('pos:listParked', () => db.listParked(database, cartOwner()));
+  ipcMain.handle('pos:resumeParked', (_e, id) => db.resumeParked(database, cartOwner(), id));
+  ipcMain.handle('pos:discardParked', (_e, id) => db.discardParked(database, cartOwner(), id));
+
+  // Shifts belong to whoever is signed in; non-owners only ever see their own.
+  ipcMain.handle('pos:openShift', (_e, { openingFloat }) => db.openShift(database, cartOwner(), openingFloat));
+  ipcMain.handle('pos:currentShift', () => {
+    const shift = db.getOpenShift(database, cartOwner());
+    return shift ? db.getShiftReport(database, shift.id) : null;
+  });
+  ipcMain.handle('pos:cashMovement', (_e, movement) => db.addCashMovement(database, cartOwner(), movement));
+  ipcMain.handle('pos:closeShift', (_e, args) => db.closeShift(database, cartOwner(), args));
+  ipcMain.handle('pos:listShifts', () => db.listShifts(database, { owner: auth.getUserProfile(database).is_owner ? null : cartOwner() }));
+  ipcMain.handle('pos:getShiftReport', (_e, shiftId) => {
+    const report = db.getShiftReport(database, shiftId);
+    if (report && !auth.getUserProfile(database).is_owner && report.shift.owner !== cartOwner()) {
+      const err = new Error("You can only open your own shifts' reports.");
+      err.code = 'forbidden';
+      throw err;
+    }
+    return report;
+  });
+
   ipcMain.handle('pos:createSale', (_e, input) => {
-    const result = db.createSale(database)(input);
+    const result = db.createSale(database)({ ...input, cart_owner: cartOwner() });
     syncEngine.pushNow(); // the whole point of this line — a sale should reach the cloud immediately, not up to 15s later
     return result;
   });
@@ -81,8 +109,8 @@ app.whenReady().then(() => {
     syncEngine.pushNow();
     return result;
   });
-  ipcMain.handle('pos:addPayment', (_e, { saleId, amount }) => {
-    const result = db.addPayment(database)(saleId, amount);
+  ipcMain.handle('pos:addPayment', (_e, { saleId, amount, method, reference }) => {
+    const result = db.addPayment(database)(saleId, amount, { method, reference, owner: cartOwner() });
     syncEngine.pushNow();
     return result;
   });
@@ -92,6 +120,12 @@ app.whenReady().then(() => {
     database.prepare(`SELECT COUNT(*) AS n FROM sync_queue WHERE status = 'pending'`).get().n
   );
   ipcMain.handle('pos:syncStatus', () => syncEngine.getStatus());
+  // Puts every change the cloud rejected (or that gave up) back in line and tries again now.
+  ipcMain.handle('pos:retryFailedSync', () => {
+    const retried = db.retryFailedSync(database);
+    syncEngine.pushNow();
+    return retried;
+  });
   ipcMain.handle('pos:login', async (_e, { username, password }) => {
     await auth.login(database, username, password);
     return { ok: true };
@@ -170,7 +204,9 @@ app.whenReady().then(() => {
   // Background loops — see heartbeat.js and sync.js. Both are pure
   // "try, and quietly skip if offline" loops; neither can block or break
   // anything the cashier is doing at the till.
-  startHeartbeat(database, { deviceName: os.hostname() });
+  // appVersion: the heartbeat used to fall back to a hard-coded '0.1.0', so every till reported
+  // the same version to the dashboard no matter what was actually installed.
+  startHeartbeat(database, { deviceName: os.hostname(), appVersion: app.getVersion() });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

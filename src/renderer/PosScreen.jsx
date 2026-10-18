@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
-import { money, posErrorMessage } from './format.js';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { money, posErrorMessage, methodLabel, paymentsSummary } from './format.js';
 import { Icons } from './Icons.jsx';
 import CashCalculator from './CashCalculator.jsx';
+import SplitPaymentModal from './SplitPaymentModal.jsx';
 import Receipt from './Receipt.jsx';
 import CustomerPicker from './CustomerPicker.jsx';
 import { CATEGORY_LABELS } from './categories.js';
@@ -29,6 +30,9 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
   const [customer, setCustomer] = useState(null);
   const [paymentMethod, setPaymentMethod] = useState('cash');
   const [installment, setInstallment] = useState(false);
+  // "Split payment": one sale paid by several methods. null = not splitting (the ordinary one-method flow).
+  const [splitPayments, setSplitPayments] = useState(null);
+  const [splitOpen, setSplitOpen] = useState(false);
   const [amountPaid, setAmountPaid] = useState('');
   const [customOpen, setCustomOpen] = useState(false);
   const [customName, setCustomName] = useState('');
@@ -38,6 +42,12 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
   const [lastReceipt, setLastReceipt] = useState(null);
   const [cashReceived, setCashReceived] = useState('');
   const [lastCashInfo, setLastCashInfo] = useState({ received: 0, change: 0 });
+  // Unfinished-cart recovery. `restoredRef` stays false until the saved draft (if any) has been
+  // looked at, so the empty starting cart can never overwrite it.
+  const restoredRef = useRef(false);
+  const [restoredNote, setRestoredNote] = useState(false);
+  const [parked, setParked] = useState([]);
+  const [parkedOpen, setParkedOpen] = useState(false);
 
   function loadCatalog() {
     window.pos.listProducts({}).then((rows) => {
@@ -47,6 +57,54 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
   }
 
   useEffect(() => { loadCatalog(); }, [refreshKey]);
+
+  // ---- unfinished carts: restore after a crash / power cut, autosave, park and resume ----------
+  // Put a saved cart on screen. Prices and quantities stay as the cashier left them; only the
+  // "can't sell more than we have" ceiling is refreshed from the current stock.
+  function showCart(saved) {
+    const stock = new Map(catalog.map((p) => [p.id, p.quantity]));
+    setCart((saved.lines || []).map((l) => (l.product_id && stock.has(l.product_id) ? { ...l, maxQty: stock.get(l.product_id) } : l)));
+    setCustomer(saved.customer || null);
+    setCustomerName(saved.customerName || '');
+  }
+  const currentCart = () => ({ lines: cart, customer, customerName });
+  function refreshParked() { window.pos.listParked().then(setParked).catch(() => {}); }
+
+  useEffect(() => {
+    if (loadingCatalog || restoredRef.current) return;
+    window.pos.loadDraft().then((draft) => {
+      if (draft && draft.lines && draft.lines.length > 0) { showCart(draft); setRestoredNote(true); }
+    }).catch(() => {}).finally(() => { restoredRef.current = true; });
+    refreshParked();
+  }, [loadingCatalog]);
+
+  // Saved shortly after every change, so even an abrupt power loss costs at most a fraction of a second.
+  useEffect(() => {
+    if (!restoredRef.current) return undefined;
+    const id = setTimeout(() => { window.pos.saveDraft({ lines: cart, customer, customerName }).catch(() => {}); }, 400);
+    return () => clearTimeout(id);
+  }, [cart, customer, customerName]);
+
+  async function parkCurrent() {
+    try {
+      await window.pos.parkCart(currentCart());
+      setCart([]); setCustomer(null); setCustomerName(''); setRestoredNote(false);
+      refreshParked();
+    } catch (err) { setError(posErrorMessage(err, 'Could not park this cart.')); }
+  }
+  async function resumeCart(id) {
+    try {
+      await window.pos.saveDraft(currentCart());          // make sure an active cart is stored; it gets parked, not lost
+      showCart(await window.pos.resumeParked(id));
+      setParkedOpen(false); setRestoredNote(false);
+      refreshParked();
+    } catch (err) { setError(posErrorMessage(err, 'Could not resume that cart.')); refreshParked(); }
+  }
+  async function discardCart(id) {
+    if (!confirm('Discard this parked cart?')) return;
+    await window.pos.discardParked(id);
+    refreshParked();
+  }
 
   const categories = useMemo(() => Array.from(new Set(catalog.map((i) => i.category).filter(Boolean))), [catalog]);
 
@@ -61,8 +119,14 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
 
   const subtotal = cart.reduce((sum, l) => sum + l.quantity * Number(l.unit_price || 0), 0);
   const cartCount = cart.reduce((n, l) => n + l.quantity, 0);
-  const isCashDue = paymentMethod === 'cash' && !installment;
+  const isSplit = splitPayments !== null;
+  const isCashDue = paymentMethod === 'cash' && !installment && !isSplit;
   const cashShort = isCashDue && Number(cashReceived || 0) < subtotal;
+  // A split is only valid for the total it was entered against: if the cart changes, drop it rather
+  // than let a stale split be charged against a different amount.
+  useEffect(() => {
+    if (splitPayments && Math.abs(splitPayments.reduce((s, p) => s + p.amount, 0) - subtotal) > 0.005) setSplitPayments(null);
+  }, [subtotal]);
 
   // Every completed sale auto-prints a receipt: `lastReceipt` becomes a
   // new object each time charge() succeeds, so this fires once per sale.
@@ -144,9 +208,10 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
       const payload = {
         customer_id: customer?.id || null,
         customer_name: customerName || 'Walk-in',
-        payment_method: paymentMethod,
+        payment_method: isSplit ? splitPayments[0].method : paymentMethod,
         status: installment ? 'outstanding' : 'completed',
         amount_paid: installment ? Number(amountPaid || 0) : undefined,
+        ...(isSplit ? { payments: splitPayments } : {}),
         items: cart.map((l) => ({
           product_id: l.product_id,
           item_name: l.item_name,
@@ -157,9 +222,10 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
         })),
       };
       const sale = await window.pos.createSale(payload);
+      const splitCash = isSplit ? splitPayments.find((p) => p.method === 'cash' && p.tendered) : null;
       setLastCashInfo({
-        received: isCashDue ? Number(cashReceived || 0) : sale.total,
-        change: isCashDue ? Number(cashReceived || 0) - sale.total : 0,
+        received: isCashDue ? Number(cashReceived || 0) : splitCash ? splitCash.tendered : sale.total,
+        change: isCashDue ? Number(cashReceived || 0) - sale.total : splitCash ? splitCash.tendered - splitCash.amount : 0,
       });
       setLastReceipt(sale); // triggers the auto-print effect above
       setCart([]);
@@ -168,6 +234,7 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
       setInstallment(false);
       setAmountPaid('');
       setCashReceived('');
+      setSplitPayments(null);
       loadCatalog();
       onSaleComplete?.();
     } catch (err) {
@@ -255,8 +322,18 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
       <div className="cart-panel">
         <div className="cart-head">
           <h3>Cart ({cartCount})</h3>
-          {cart.length > 0 && <button className="btn ghost small" onClick={() => setCart([])}>Clear</button>}
+          <div style={{ display: 'flex', gap: 6 }}>
+            {parked.length > 0 && <button className="btn ghost small" onClick={() => setParkedOpen(true)}>Parked ({parked.length})</button>}
+            {cart.length > 0 && <button className="btn ghost small" onClick={parkCurrent}>Park</button>}
+            {cart.length > 0 && <button className="btn ghost small" onClick={() => setCart([])}>Clear</button>}
+          </div>
         </div>
+        {restoredNote && (
+          <div style={{ fontSize: 12, padding: '6px 12px', color: 'var(--warn)' }}>
+            Restored the sale you were in the middle of.
+            <button className="btn ghost small" style={{ marginLeft: 8 }} onClick={() => setRestoredNote(false)}>OK</button>
+          </div>
+        )}
         <div className="cart-items">
           {cart.length === 0 ? (
             <div className="cart-empty">Tap a product to add it to the cart.</div>
@@ -286,15 +363,26 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
               onChange={({ customer: c, customerName: n }) => { setCustomer(c); setCustomerName(n); }}
             />
           </div>
-          <div className="pay-methods">
-            {['cash', 'transfer', 'pos'].map((m) => (
-              <button key={m} type="button" className={`pay-method ${paymentMethod === m ? 'active' : ''}`} onClick={() => setPaymentMethod(m)}>
-                {m === 'pos' ? 'POS/Card' : m[0].toUpperCase() + m.slice(1)}
-              </button>
-            ))}
-          </div>
+          {isSplit ? (
+            <div className="split-summary" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, fontSize: 12.5, padding: '6px 0' }}>
+              <span><b>Split:</b> {paymentsSummary(splitPayments)}</span>
+              <span style={{ display: 'flex', gap: 4 }}>
+                <button type="button" className="btn ghost small" onClick={() => setSplitOpen(true)}>Edit</button>
+                <button type="button" className="btn ghost small" onClick={() => setSplitPayments(null)}>Clear</button>
+              </span>
+            </div>
+          ) : (
+            <div className="pay-methods">
+              {['cash', 'transfer', 'pos'].map((m) => (
+                <button key={m} type="button" className={`pay-method ${paymentMethod === m ? 'active' : ''}`} onClick={() => setPaymentMethod(m)}>
+                  {m === 'pos' ? 'POS/Card' : m[0].toUpperCase() + m.slice(1)}
+                </button>
+              ))}
+              <button type="button" className="pay-method" disabled={installment || subtotal <= 0} onClick={() => setSplitOpen(true)}>Split</button>
+            </div>
+          )}
           <label className="installment-toggle">
-            <input type="checkbox" checked={installment} onChange={(e) => setInstallment(e.target.checked)} />
+            <input type="checkbox" checked={installment} disabled={isSplit} onChange={(e) => setInstallment(e.target.checked)} />
             Customer is paying in installments
           </label>
           {installment && (
@@ -316,6 +404,38 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
       </div>
 
       <Receipt sale={lastReceipt} cashReceived={lastCashInfo.received} change={lastCashInfo.change} shop={profile} />
+
+      {splitOpen && (
+        <SplitPaymentModal
+          due={subtotal}
+          initial={splitPayments}
+          onClose={() => setSplitOpen(false)}
+          onConfirm={(payments) => { setSplitPayments(payments); setSplitOpen(false); }}
+        />
+      )}
+
+      {parkedOpen && (
+        <div className="modal-backdrop" onClick={() => setParkedOpen(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>Parked carts</h3>
+            {parked.length === 0 ? <div className="empty">Nothing parked.</div> : parked.map((p) => (
+              <div key={p.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '8px 0', borderBottom: '1px solid var(--border)' }}>
+                <div>
+                  <div>{p.label}</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>{p.item_count} item{p.item_count === 1 ? '' : 's'} · <span className="num">{money(p.total)}</span></div>
+                </div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button type="button" className="btn small" onClick={() => resumeCart(p.id)}>Resume</button>
+                  <button type="button" className="btn ghost small" onClick={() => discardCart(p.id)}>Discard</button>
+                </div>
+              </div>
+            ))}
+            <div className="modal-actions">
+              <button type="button" className="btn ghost" onClick={() => setParkedOpen(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {customOpen && (
         <div className="modal-backdrop" onClick={() => setCustomOpen(false)}>

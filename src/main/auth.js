@@ -298,25 +298,46 @@ function getAccessToken(db) {
   return tokens ? tokens.access : null;
 }
 
-async function refreshAccessToken(db) {
+/**
+ * Refreshes the access token and reports WHY when it can't:
+ *   { ok: true, token }
+ *   { ok: false, reason: 'network' }     -- no response at all (offline); says nothing about the session
+ *   { ok: false, reason: 'rejected' }    -- the server refused the refresh token: sign in again
+ *   { ok: false, reason: 'no_session' }  -- never signed in / signed out
+ *   { ok: false, reason: 'server' }      -- the server answered but is unwell (5xx, bad body)
+ * The sync engine needs the difference: "offline" must not be reported as "your session expired".
+ */
+async function refreshSession(db) {
   const tokens = getStoredTokens(db);
-  if (!tokens || !tokens.refresh) return null;
+  if (!tokens || !tokens.refresh) return { ok: false, reason: 'no_session' };
+  let res;
   try {
-    const res = await fetch(`${API_BASE}/auth/refresh/`, {
+    res = await fetch(`${API_BASE}/auth/refresh/`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ refresh: tokens.refresh }),
       signal: AbortSignal.timeout(8000),
     });
-    if (!res.ok) return null;
-    const data = await res.json();
-    storeTokens(db, { ...tokens, access: data.access });
-    return data.access;
   } catch {
-    return null;
+    return { ok: false, reason: 'network' };
   }
+  if (res.status === 400 || res.status === 401 || res.status === 403) return { ok: false, reason: 'rejected' };
+  if (!res.ok) return { ok: false, reason: 'server' };
+  let data;
+  try { data = await res.json(); } catch { return { ok: false, reason: 'server' }; }
+  if (!data || !data.access) return { ok: false, reason: 'server' };
+  // The server rotates refresh tokens (SIMPLE_JWT ROTATE_REFRESH_TOKENS). Keeping only the
+  // new ACCESS token meant a till that was never logged out hit the original refresh
+  // token's expiry and silently stopped syncing. Store the new refresh token too.
+  storeTokens(db, { ...tokens, access: data.access, ...(data.refresh ? { refresh: data.refresh } : {}) });
+  return { ok: true, token: data.access };
+}
+
+async function refreshAccessToken(db) {
+  const result = await refreshSession(db);
+  return result.ok ? result.token : null;
 }
 
 module.exports = {
-  login, logout, getAccessToken, refreshAccessToken, getStoredTokens, getUserProfile, hasShopSettings,
+  login, logout, getAccessToken, refreshAccessToken, refreshSession, getStoredTokens, getUserProfile, hasShopSettings,
 };

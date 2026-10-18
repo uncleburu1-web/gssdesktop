@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { money, fmtDateTime, posErrorMessage } from './format.js';
+import { money, fmtDateTime, posErrorMessage, methodLabel, paymentsSummary } from './format.js';
 
 function ItemsSummary({ items }) {
   if (!items || items.length === 0) return '—';
@@ -8,17 +8,38 @@ function ItemsSummary({ items }) {
   return items.length > 1 ? `${label} +${items.length - 1} more` : label;
 }
 
+// How many sales to fetch per screenful. The till used to load EVERY sale ever made on each open,
+// so this screen got slower with every sale and eventually froze.
+const PAGE_SIZE = 100;
+
 export default function SalesHistoryScreen({ refreshKey }) {
   const [tab, setTab] = useState('completed');
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState('');
   const [payModal, setPayModal] = useState(null);
   const [payAmount, setPayAmount] = useState('');
+  const [payMethod, setPayMethod] = useState('cash');
+  const [payReference, setPayReference] = useState('');
 
   function load() {
     setLoading(true);
-    window.pos.listSales({ status: tab }).then((data) => { setRows(data); setLoading(false); });
+    window.pos.listSales({ status: tab, limit: PAGE_SIZE, offset: 0 }).then((data) => {
+      setRows(data);
+      setHasMore(data.length === PAGE_SIZE);
+      setLoading(false);
+    });
+  }
+
+  function loadMore() {
+    setLoadingMore(true);
+    window.pos.listSales({ status: tab, limit: PAGE_SIZE, offset: rows.length }).then((data) => {
+      setRows((prev) => [...prev, ...data]);
+      setHasMore(data.length === PAGE_SIZE);
+      setLoadingMore(false);
+    });
   }
 
   useEffect(() => { load(); }, [tab, refreshKey]);
@@ -35,7 +56,7 @@ export default function SalesHistoryScreen({ refreshKey }) {
     const amt = Number(payAmount);
     if (!amt || amt <= 0) return;
     try {
-      await window.pos.addPayment(payModal.id, amt);
+      await window.pos.addPayment(payModal.id, amt, { method: payMethod, reference: payReference });
       setPayModal(null);
       load();
     } catch (err) {
@@ -72,10 +93,16 @@ export default function SalesHistoryScreen({ refreshKey }) {
               <tbody>
                 {rows.map((s) => (
                   <tr key={s.id}>
-                    <td className="mono" style={{ fontSize: 12.5 }}>{fmtDateTime(s.date)}</td>
+                    <td className="mono" style={{ fontSize: 12.5 }}>
+                      {fmtDateTime(s.date)}
+                      {s.receipt_no && <div style={{ fontSize: 11, color: 'var(--text-dim)' }}>{s.receipt_no}</div>}
+                    </td>
                     <td><ItemsSummary items={s.items} /></td>
                     <td>{s.customer_name || 'Walk-in'}</td>
-                    <td className="num">{money(s.total)}</td>
+                    <td className="num">
+                      {money(s.total)}
+                      {(s.payments || []).length > 1 && <div style={{ fontSize: 11, color: 'var(--text-dim)' }}>{paymentsSummary(s.payments)}</div>}
+                    </td>
                     {tab === 'outstanding' ? (
                       <>
                         <td className="num">{money(s.amount_paid)}</td>
@@ -86,7 +113,7 @@ export default function SalesHistoryScreen({ refreshKey }) {
                     )}
                     <td className="row-actions">
                       {tab === 'outstanding' && (
-                        <button className="btn small" onClick={() => { setPayModal(s); setPayAmount(''); }}>Pay</button>
+                        <button className="btn small" onClick={() => { setPayModal(s); setPayAmount(''); setPayMethod('cash'); setPayReference(''); }}>Pay</button>
                       )}
                       <button className="btn ghost small" onClick={() => handleDelete(s.id)}>Delete</button>
                     </td>
@@ -94,6 +121,13 @@ export default function SalesHistoryScreen({ refreshKey }) {
                 ))}
               </tbody>
             </table>
+            {hasMore && (
+              <div style={{ textAlign: 'center', padding: 12 }}>
+                <button className="btn ghost" onClick={loadMore} disabled={loadingMore}>
+                  {loadingMore ? 'Loading…' : 'Load more'}
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -110,6 +144,18 @@ export default function SalesHistoryScreen({ refreshKey }) {
                 <label>Payment amount (₦)</label>
                 <input required autoFocus type="number" min="1" max={payModal.balance_due} value={payAmount} onChange={(e) => setPayAmount(e.target.value)} />
               </div>
+              <div className="field">
+                <label htmlFor="pay-method">Paid by</label>
+                <select id="pay-method" value={payMethod} onChange={(e) => setPayMethod(e.target.value)}>
+                  {['cash', 'transfer', 'pos'].map((m) => <option key={m} value={m}>{methodLabel(m)}</option>)}
+                </select>
+              </div>
+              {payMethod !== 'cash' && (
+                <div className="field">
+                  <label htmlFor="pay-reference">Reference (optional)</label>
+                  <input id="pay-reference" type="text" maxLength={64} value={payReference} onChange={(e) => setPayReference(e.target.value)} />
+                </div>
+              )}
               <div className="modal-actions">
                 <button type="button" className="btn ghost" onClick={() => setPayModal(null)}>Cancel</button>
                 <button type="submit" className="btn">Record payment</button>

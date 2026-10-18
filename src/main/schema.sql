@@ -10,6 +10,70 @@ CREATE TABLE IF NOT EXISTS app_settings (
   value TEXT
 );
 
+-- Every payment taken against a sale: one row per method used, so a sale can be paid by cash +
+-- transfer + card, and an installment sale collects several payments over time. `amount` is what
+-- was APPLIED to the sale; for cash, `tendered` is what the customer handed over and `change_given`
+-- what went back, so only `amount` ever stays in the drawer. Not a synced record kind: it travels
+-- inside the sale that is uploaded (see getSale / createSale).
+CREATE TABLE IF NOT EXISTS sale_payments (
+  id TEXT PRIMARY KEY,
+  sale_id TEXT NOT NULL REFERENCES sales(id),
+  shift_id TEXT,
+  method TEXT NOT NULL,
+  amount REAL NOT NULL,
+  tendered REAL,
+  change_given REAL NOT NULL DEFAULT 0,
+  reference TEXT NOT NULL DEFAULT '',
+  paid_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  is_deleted INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sale_payments_sale ON sale_payments(sale_id);
+CREATE INDEX IF NOT EXISTS idx_sale_payments_shift ON sale_payments(shift_id, method);
+
+-- A cashier's till session: opening float, the sales and payments taken, cash moved in/out, and a
+-- frozen Z-report at close. Local bookkeeping for now (not uploaded). One open shift per cashier.
+CREATE TABLE IF NOT EXISTS shifts (
+  id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  opened_at TEXT NOT NULL,
+  opening_float REAL NOT NULL DEFAULT 0,
+  closed_at TEXT,
+  counted_cash REAL,
+  expected_cash REAL,
+  variance REAL,
+  z_number INTEGER,
+  notes TEXT NOT NULL DEFAULT '',
+  report_json TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_shift_per_owner ON shifts(owner) WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS idx_shifts_opened ON shifts(opened_at);
+
+CREATE TABLE IF NOT EXISTS cash_movements (
+  id TEXT PRIMARY KEY,
+  shift_id TEXT NOT NULL REFERENCES shifts(id),
+  kind TEXT NOT NULL,
+  amount REAL NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cash_movements_shift ON cash_movements(shift_id);
+
+-- The cashier's unfinished work. LOCAL SCRATCH SPACE: never synced, never part of the books.
+--   status 'draft'  : the cart currently on screen, saved continuously, so a crash or power cut
+--                     doesn't lose it (one row per cashier: id = 'draft:<owner>')
+--   status 'parked' : a cart set aside to serve someone else, resumed later
+CREATE TABLE IF NOT EXISTS carts (
+  id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'draft',
+  label TEXT NOT NULL DEFAULT '',
+  cart_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_carts_owner ON carts(owner, status, updated_at);
+
 CREATE TABLE IF NOT EXISTS categories (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -99,6 +163,12 @@ CREATE TABLE IF NOT EXISTS sale_items (
   synced_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
+-- Sales history: newest-first, optionally one status, paged. Without these every open of the
+-- history screen sorted the whole table.
+CREATE INDEX IF NOT EXISTS idx_sales_active_date ON sales(is_deleted, date DESC);
+CREATE INDEX IF NOT EXISTS idx_sales_status_date ON sales(is_deleted, status, date DESC);
+CREATE INDEX IF NOT EXISTS idx_sales_customer ON sales(customer_id, status);
+CREATE INDEX IF NOT EXISTS idx_sale_items_product ON sale_items(product_id);
 
 -- Which batch(es) a sale line drew stock from — lets deletes/restores be
 -- exact instead of guessed, same as the cloud's SaleAllocation.
@@ -126,6 +196,13 @@ CREATE TABLE IF NOT EXISTS sync_queue (
   status TEXT NOT NULL DEFAULT 'pending',  -- 'pending' | 'synced' | 'failed'
   retry_count INTEGER NOT NULL DEFAULT 0,
   next_attempt_at TEXT,            -- exponential backoff after a failed attempt; NULL = eligible now
-  last_error TEXT
+  last_error TEXT,
+  device_id TEXT,                  -- which till queued it (app_settings.device_id); NULL on rows older than this column
+  actor TEXT,                      -- username signed in when it was queued; NULL if nobody was (startup reconcile)
+  last_attempt_at TEXT,            -- last time the cloud ANSWERED for this row (no answer = offline, not an attempt)
+  acked_at TEXT                    -- when the cloud confirmed it (applied / already_applied)
 );
 CREATE INDEX IF NOT EXISTS idx_sync_queue_status ON sync_queue(status, client_timestamp);
+-- applyPulled* asks "does THIS till still have an unpushed edit of this exact row?" for every
+-- pulled row; without this that is a full scan of the outbox per row.
+CREATE INDEX IF NOT EXISTS idx_sync_queue_entity ON sync_queue(entity_type, entity_id);
