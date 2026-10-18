@@ -88,6 +88,7 @@ function migrate(db) {
   for (const column of ['device_id', 'actor', 'last_attempt_at', 'acked_at']) {
     if (!hasColumn('sync_queue', column)) db.exec(`ALTER TABLE sync_queue ADD COLUMN ${column} TEXT`);
   }
+  backfillSyncedAt(db);
   backfillPayments(db);
 }
 
@@ -161,6 +162,18 @@ function enqueueSync(db, { entityType, entityId, operation, payload }) {
     `INSERT INTO sync_queue (id, entity_type, entity_id, operation, payload, client_timestamp, status, retry_count, device_id, actor)
      VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)`
   ).run(uuid(), entityType, entityId, operation, JSON.stringify(payload), nowIso(), getOrCreateDeviceId(db), currentActor(db));
+}
+
+/**
+ * The sync protocol the cloud last said it understands (sync.js stores it from every pull).
+ *   1: a sale travels as 'sale' + one 'sale_item' per line; an installment as a 'sale' update
+ *   2: a sale travels as ONE 'sale_doc' (header, lines, payments); an installment as a 'sale_payment'
+ * A till never sends protocol-2 operations to a cloud that has not announced it.
+ */
+function cloudSyncProtocol(db) {
+  const row = db.prepare(`SELECT value FROM app_settings WHERE key = 'cloud_sync_protocol'`).get();
+  const n = row ? Number(row.value) : 1;
+  return Number.isFinite(n) && n > 0 ? n : 1;
 }
 
 /** Username of whoever is signed in on this till right now (auth.js keeps it in app_settings), or null. */
@@ -495,6 +508,43 @@ function applyPulledSale(db, entityId, operation, payload) {
       payload.staff_name || '', payload.payment_method || 'cash', payload.status || 'completed', payload.amount_paid || 0,
       payload.date || ts, ts, ts, ts);
   }
+  if (Array.isArray(payload.payments)) mergePulledPayments(db, entityId, payload.payments, payload.status);
+}
+
+/**
+ * A cloud on sync protocol 2 sends every payment with the sale. Payments are merged by id, never
+ * replaced, and amount_paid is then the sum of what this till holds: its own payments (even ones
+ * not uploaded yet) plus any taken elsewhere, e.g. an installment paid on the web.
+ *
+ * A "legacy" cloud payment is one lump standing in for an amount recorded before payments were
+ * itemised. When this till already has its own itemised payments for the sale, that lump is the
+ * SAME money again, so it is not added (it would count twice).
+ */
+function mergePulledPayments(db, saleId, payments, pulledStatus) {
+  const ts = nowIso();
+  const localIds = new Set(db.prepare(`SELECT id FROM sale_payments WHERE sale_id = ?`).all(saleId).map((r) => r.id));
+  const hasOwnPayments = (legacyId) => [...localIds].some((id) => id !== legacyId);
+  const insert = db.prepare(
+    `INSERT INTO sale_payments (id, sale_id, shift_id, method, amount, tendered, change_given, reference, paid_at, created_at, is_deleted)
+     VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 0)`
+  );
+  for (const p of payments) {
+    if (!p || !p.id) continue;
+    const amount = money2(p.amount);
+    if (localIds.has(p.id)) {
+      // Only a legacy lump can change (an older till re-sent its total); itemised payments never do.
+      if (p.source === 'legacy') db.prepare(`UPDATE sale_payments SET amount = ? WHERE id = ?`).run(amount, p.id);
+      continue;
+    }
+    if (p.source === 'legacy' && hasOwnPayments(p.id)) continue;
+    insert.run(p.id, saleId, PAYMENT_METHODS.includes(p.method) ? p.method : 'cash', amount,
+      p.tendered == null ? null : money2(p.tendered), money2(p.change_given || 0), String(p.reference || ''), p.paid_at || ts, ts);
+    localIds.add(p.id);
+  }
+  const paid = money2(db.prepare(`SELECT COALESCE(SUM(amount), 0) AS n FROM sale_payments WHERE sale_id = ? AND is_deleted = 0`).get(saleId).n);
+  const sale = getSale(db, saleId);
+  const status = sale.items.length > 0 && paid >= sale.total - 0.005 ? 'completed' : (pulledStatus || sale.status);
+  db.prepare(`UPDATE sales SET amount_paid = ?, status = ? WHERE id = ?`).run(paid, status, saleId);
 }
 
 function applyPulledSaleItem(db, entityId, operation, payload) {
@@ -698,9 +748,15 @@ const createSale = (db) => db.transaction((input) => {
   if (input.cart_owner) db.prepare(`DELETE FROM carts WHERE id = ?`).run(draftId(input.cart_owner));
 
   const finalSale = getSale(db, saleId);
-  enqueueSync(db, { entityType: 'sale', entityId: saleId, operation: 'create', payload: finalSale });
-  for (const item of finalSale.items) {
-    enqueueSync(db, { entityType: 'sale_item', entityId: item.id, operation: 'create', payload: item });
+  if (cloudSyncProtocol(db) >= 2) {
+    // ONE outbox row carries the whole sale (header, lines, payments); the cloud applies it in one
+    // transaction, so it can never hold a sale with only some of its lines.
+    enqueueSync(db, { entityType: 'sale_doc', entityId: saleId, operation: 'create', payload: finalSale });
+  } else {
+    enqueueSync(db, { entityType: 'sale', entityId: saleId, operation: 'create', payload: finalSale });
+    for (const item of finalSale.items) {
+      enqueueSync(db, { entityType: 'sale_item', entityId: item.id, operation: 'create', payload: item });
+    }
   }
   return finalSale;
 });
@@ -730,16 +786,23 @@ const addPayment = (db) => db.transaction((saleId, amount, opts = {}) => {
   const payment = cleanPayment({ method: opts.method || sale.payment_method || 'cash', amount: applied, tendered: opts.tendered, reference: opts.reference });
   const shift = opts.owner ? getOpenShift(db, opts.owner) : null;
   const ts = nowIso();
+  const paymentId = uuid();
   db.prepare(
     `INSERT INTO sale_payments (id, sale_id, shift_id, method, amount, tendered, change_given, reference, paid_at, created_at, is_deleted)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
-  ).run(uuid(), saleId, shift ? shift.id : null, payment.method, payment.amount, payment.tendered, payment.change_given, payment.reference, ts, ts);
+  ).run(paymentId, saleId, shift ? shift.id : null, payment.method, payment.amount, payment.tendered, payment.change_given, payment.reference, ts, ts);
   const newPaid = money2(sale.amount_paid + applied);
   const newStatus = newPaid >= sale.total - 0.005 ? 'completed' : sale.status;
   db.prepare(`UPDATE sales SET amount_paid = ?, status = ?, updated_at = ? WHERE id = ?`)
     .run(newPaid, newStatus, ts, saleId);
   const updated = getSale(db, saleId);
-  enqueueSync(db, { entityType: 'sale', entityId: saleId, operation: 'update', payload: updated });
+  if (cloudSyncProtocol(db) >= 2) {
+    // Append-only: the cloud ADDS this payment, so one taken on the web meanwhile still counts.
+    const row = db.prepare(`SELECT * FROM sale_payments WHERE id = ?`).get(paymentId);
+    enqueueSync(db, { entityType: 'sale_payment', entityId: paymentId, operation: 'create', payload: row });
+  } else {
+    enqueueSync(db, { entityType: 'sale', entityId: saleId, operation: 'update', payload: updated });
+  }
   return updated;
 });
 
@@ -1070,20 +1133,26 @@ const retryFailedSync = (db) => db.transaction(() => {
  * its status) is never touched twice.
  */
 function reconcileUnsyncedRows(db) {
+  // A row needs queueing only if the cloud has NEVER confirmed it (synced_at IS NULL: set when a push
+  // is acknowledged, and on every row that came FROM the cloud) and nothing in the outbox covers it.
+  // Without the synced_at test this re-queued, at every startup, every row whose outbox entry had been
+  // pruned (after 24 h) and every row pulled from the cloud: the till re-uploaded its whole history,
+  // stale copies and all. A sale queued as one 'sale_doc' covers the sale AND its lines.
   const tables = [
-    { table: 'products', entityType: 'product' },
-    { table: 'stock_batches', entityType: 'stock_batch' },
-    { table: 'customers', entityType: 'customer' },
-    { table: 'sales', entityType: 'sale' },
-    { table: 'sale_items', entityType: 'sale_item' },
+    { table: 'products', entityType: 'product', covered: `q.entity_type = 'product' AND q.entity_id = t.id` },
+    { table: 'stock_batches', entityType: 'stock_batch', covered: `q.entity_type = 'stock_batch' AND q.entity_id = t.id` },
+    { table: 'customers', entityType: 'customer', covered: `q.entity_type = 'customer' AND q.entity_id = t.id` },
+    { table: 'sales', entityType: 'sale', covered: `q.entity_type IN ('sale', 'sale_doc') AND q.entity_id = t.id` },
+    { table: 'sale_items', entityType: 'sale_item',
+      covered: `(q.entity_type = 'sale_item' AND q.entity_id = t.id) OR (q.entity_type = 'sale_doc' AND q.entity_id = t.sale_id)` },
   ];
   let queued = 0;
-  for (const { table, entityType } of tables) {
+  for (const { table, entityType, covered } of tables) {
     const orphans = db.prepare(
       `SELECT t.* FROM ${table} t
-       LEFT JOIN sync_queue q ON q.entity_id = t.id AND q.entity_type = ?
-       WHERE q.id IS NULL AND t.is_deleted = 0`
-    ).all(entityType);
+       WHERE t.is_deleted = 0 AND t.synced_at IS NULL
+         AND NOT EXISTS (SELECT 1 FROM sync_queue q WHERE ${covered})`
+    ).all();
     for (const row of orphans) {
       enqueueSync(db, { entityType, entityId: row.id, operation: 'create', payload: row });
       queued += 1;
@@ -1091,6 +1160,47 @@ function reconcileUnsyncedRows(db) {
   }
   if (queued > 0) console.log(`[sync] reconcile: found and queued ${queued} row(s) that had never been synced at all`);
   return queued;
+}
+
+/**
+ * One-time, on the first open of this version: stamp synced_at on every row that nothing in the
+ * outbox covers. Such a row was already confirmed by the cloud: synced outbox rows are the only
+ * ones ever pruned, pending and failed ones never are, and pulled rows already carry synced_at.
+ * Before this version only pulled rows got synced_at, so without this the first startup after the
+ * upgrade would re-upload the till's entire history one last time.
+ */
+function backfillSyncedAt(db) {
+  if (db.prepare(`SELECT 1 FROM app_settings WHERE key = 'synced_at_backfill_v1'`).get()) return;
+  const covers = {
+    products: `q.entity_type = 'product' AND q.entity_id = t.id`,
+    stock_batches: `q.entity_type = 'stock_batch' AND q.entity_id = t.id`,
+    customers: `q.entity_type = 'customer' AND q.entity_id = t.id`,
+    sales: `q.entity_type IN ('sale', 'sale_doc') AND q.entity_id = t.id`,
+    sale_items: `(q.entity_type = 'sale_item' AND q.entity_id = t.id) OR (q.entity_type = 'sale_doc' AND q.entity_id = t.sale_id)`,
+  };
+  const at = nowIso();
+  db.transaction(() => {
+    for (const [table, covered] of Object.entries(covers)) {
+      db.prepare(
+        `UPDATE ${table} AS t SET synced_at = ? WHERE t.synced_at IS NULL AND NOT EXISTS (SELECT 1 FROM sync_queue q WHERE ${covered})`
+      ).run(at);
+    }
+    db.prepare(`INSERT INTO app_settings (key, value) VALUES ('synced_at_backfill_v1', ?)`).run(at);
+  })();
+}
+
+// Which local rows an acknowledged outbox row stands for (sale_payment rows have no synced_at column).
+const ACK_TABLES = { product: 'products', stock_batch: 'stock_batches', customer: 'customers', sale: 'sales', sale_item: 'sale_items' };
+
+/** The cloud confirmed this outbox row: stamp synced_at on the local row(s) it carried. */
+function markEntitySynced(db, entityType, entityId, at) {
+  if (entityType === 'sale_doc') {
+    db.prepare(`UPDATE sales SET synced_at = ? WHERE id = ?`).run(at, entityId);
+    db.prepare(`UPDATE sale_items SET synced_at = ? WHERE sale_id = ?`).run(at, entityId);
+    return;
+  }
+  const table = ACK_TABLES[entityType];
+  if (table) db.prepare(`UPDATE ${table} SET synced_at = ? WHERE id = ?`).run(at, entityId);
 }
 
 module.exports = {
@@ -1115,6 +1225,7 @@ module.exports = {
   setLastPullAt,
   getSetting,
   setSetting,
+  cloudSyncProtocol,
   pruneSyncQueue,
   openShift,
   getOpenShift,
@@ -1131,4 +1242,5 @@ module.exports = {
   getSyncQueueStats,
   retryFailedSync,
   reconcileUnsyncedRows,
+  markEntitySynced,
 };

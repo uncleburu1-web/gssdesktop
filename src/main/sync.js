@@ -2,6 +2,7 @@ const { getAccessToken, refreshSession } = require('./auth');
 const {
   applyPulledOperation, getLastPullAt, setLastPullAt, pruneSyncQueue, reconcileUnsyncedRows, getSyncQueueStats,
   getSetting, setSetting,
+  markEntitySynced,
 } = require('./db');
 const { getOrCreateDeviceId } = require('./device');
 
@@ -130,6 +131,7 @@ function startSyncEngine(db, onDataChanged) {
       if (status === 'applied' || status === 'already_applied') {
         db.prepare(`UPDATE sync_queue SET status = 'synced', next_attempt_at = NULL, last_error = NULL, last_attempt_at = ?, acked_at = ? WHERE id = ?`)
           .run(now, now, row.id);
+        markEntitySynced(db, row.entity_type, row.entity_id, now);
       } else if (status === 'rejected') {
         const why = (outcome.error && String(outcome.error)) || 'rejected by server';
         console.error(`[sync] rejected ${row.entity_type} ${row.entity_id}: ${why}`);
@@ -344,6 +346,8 @@ function startSyncEngine(db, onDataChanged) {
     // missing a change because of clock skew between two computers. A cloud that sends next_since
     // has already moved it back behind its read, so a row committed while this pull was reading
     // comes back next time instead of being skipped forever (G4). Older clouds: server_time.
+    // Which operation formats this cloud accepts (db.cloudSyncProtocol). Absent = an older cloud = 1.
+    setSetting(db, 'cloud_sync_protocol', String(Number(body.sync_protocol) || 1));
     const cursor = body.next_since || body.server_time || new Date().toISOString();
     setLastPullAt(db, cursor);
     // What the sidebar shows as "last update from cloud": when this pull happened, not the cursor.
