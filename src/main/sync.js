@@ -35,17 +35,33 @@ function backoffMs(retryCount) {
   return Math.min(SYNC_INTERVAL_MS * 2 ** retryCount, MAX_BACKOFF_MS);
 }
 
-function wsUrl(token) {
+function wsUrl(token, deviceId) {
   const httpBase = API_BASE.replace(/\/api\/?$/, '');
   const wsBase = httpBase.replace(/^http/, 'ws');
-  return `${wsBase}/ws/live/?token=${encodeURIComponent(token)}`;
+  // &device=: the socket's pongs then count as this till's heartbeat on the cloud (stage 1b).
+  return `${wsBase}/ws/live/?token=${encodeURIComponent(token)}&device=${encodeURIComponent(deviceId)}`;
 }
+
+const PULL_PAGE_SIZE = 500;   // rows per pull page (a first sync of a big shop comes in several pages)
+const MAX_PULL_PAGES = 400;   // safety stop for one pull run (200,000 rows); the next run carries on
 
 // Sent on every sync call so the cloud scopes it to the branch this till is PAIRED to (not to
 // whatever the signed-in account would resolve to on its own: a CEO with several branches has no
 // single branch, and every push used to be refused).
 const DEVICE_HEADER = 'X-Device-ID';
 const REMOVED_MESSAGE = 'This till was removed from the shop. Sign in again to pair it.';
+
+const PAUSED_MESSAGE = 'Cloud sync is paused because the subscription has ended. Selling continues on this till; everything uploads once it is renewed.';
+
+/** The cloud's own words for a 402 (subscription ended), or a plain default. */
+async function pausedMessage(res) {
+  try {
+    const body = await res.json();
+    return (body && typeof body.detail === 'string' && body.detail) || PAUSED_MESSAGE;
+  } catch {
+    return PAUSED_MESSAGE;
+  }
+}
 
 const isTimeout = (err) => !!err && (err.name === 'TimeoutError' || err.name === 'AbortError');
 
@@ -78,7 +94,7 @@ const isTimeout = (err) => !!err && (err.name === 'TimeoutError' || err.name ===
  */
 function startSyncEngine(db, onDataChanged) {
   // ---- connectivity, as the sidebar and the owner see it ---------------------------------
-  // 'ok' | 'offline' | 'degraded' (server answered badly) | 'auth_required' | 'unsupported'
+  // 'ok' | 'offline' | 'degraded' (server answered badly) | 'auth_required' | 'unsupported' | 'paused' (subscription ended)
   const cloud = { state: 'ok', message: '', lastSuccessAt: null, lastErrorAt: null };
   function setCloud(state, message = '') {
     const was = cloud.state;
@@ -122,6 +138,20 @@ function startSyncEngine(db, onDataChanged) {
         .run(nextRetryCount, message, new Date(Date.now() + backoffMs(nextRetryCount)).toISOString(), now, row.id);
     }
   });
+
+  // After the cloud had trouble (5xx, 429, unreadable reply), rows were pushed back by up to 5 min.
+  // The moment the cloud answers properly again, those rows go straight back in line (G10), instead
+  // of sitting out their backoff while the cloud is fine. Rows waiting for a parent record keep theirs.
+  function releaseServerErrorBackoff() {
+    const released = db.prepare(
+      `UPDATE sync_queue SET next_attempt_at = NULL
+       WHERE status = 'pending' AND next_attempt_at IS NOT NULL
+         AND (last_error LIKE 'sync push responded 5%' OR last_error = 'sync push responded 429'
+              OR last_error = 'sync push returned an unreadable response')`
+    ).run().changes;
+    if (released > 0) console.log(`[sync] the cloud recovered: ${released} row(s) released from backoff`);
+    return released;
+  }
 
   const applyOutcomes = db.transaction((rows, byId) => {
     const now = new Date().toISOString();
@@ -194,6 +224,12 @@ function startSyncEngine(db, onDataChanged) {
       return 'stop';
     }
 
+    if (res.status === 402) {
+      // Subscription ended: sync is paused, not failing. Nothing is counted against the rows and
+      // nothing is lost; they all go up once the shop renews.
+      setCloud('paused', await pausedMessage(res));
+      return 'stop';
+    }
     if (res.status === 410) {
       // This till was unpaired in Settings -> Devices. Nothing is the rows' fault: keep them all
       // (they upload once someone signs in again and re-pairs the till) and burn no retries.
@@ -223,7 +259,7 @@ function startSyncEngine(db, onDataChanged) {
     }
 
     applyOutcomes(pending, new Map((result.results || []).map((r) => [r.id, r])));
-    setCloud('ok');
+    if (setCloud('ok') === 'degraded') releaseServerErrorBackoff();
     if (pending.length === batchSize) batchSize = Math.min(MAX_BATCH, Math.ceil(batchSize * 1.25));
     return 'progress';
   }
@@ -274,14 +310,16 @@ function startSyncEngine(db, onDataChanged) {
     })();
   }
 
-  async function pullOnce() {
+  /** One page of a pull. Resolves to the parsed body, or null when this run must stop (state set). */
+  async function fetchPullPage(since, cursor, entityTypes = null) {
     let token = getAccessToken(db);
-    if (!token) return; // not logged in yet
-
-    const since = getLastPullAt(db);
-    const url = since
-      ? `${API_BASE}/sync/pull/?since=${encodeURIComponent(since)}`
-      : `${API_BASE}/sync/pull/`;
+    if (!token) return null; // not logged in yet
+    const params = new URLSearchParams();
+    if (since) params.set('since', since);
+    if (entityTypes) params.set('entity_types', entityTypes);
+    params.set('limit', String(PULL_PAGE_SIZE));
+    if (cursor) params.set('cursor', cursor);
+    const url = `${API_BASE}/sync/pull/?${params.toString()}`;
     const fetchPull = (t) => fetch(url, {
       headers: { Authorization: `Bearer ${t}`, [DEVICE_HEADER]: deviceId },
       signal: AbortSignal.timeout(15_000),
@@ -295,7 +333,7 @@ function startSyncEngine(db, onDataChanged) {
         if (!refreshed.ok) {
           if (refreshed.reason === 'network') setCloud('offline', 'No internet connection.');
           else if (refreshed.reason !== 'server') setCloud('auth_required', 'Your session expired. Sign in while online to resume syncing.');
-          return;
+          return null;
         }
         res = await fetchPull(refreshed.token);
       }
@@ -303,59 +341,124 @@ function startSyncEngine(db, onDataChanged) {
       pullFailureCount += 1;
       setCloud('offline', 'No internet connection.');
       console.error(`[sync] pull could not reach the cloud (attempt ${pullFailureCount}): ${String((err && err.message) || err)}`);
-      return;
+      return null;
     }
-    if (res.status === 410) { setCloud('auth_required', REMOVED_MESSAGE); return; }
+    if (res.status === 410) { setCloud('auth_required', REMOVED_MESSAGE); return null; }
+    if (res.status === 402) { setCloud('paused', await pausedMessage(res)); return null; }
     if (!res.ok) {
       pullFailureCount += 1;
       console.error(`[sync] pull failed (attempt ${pullFailureCount}): sync pull responded ${res.status}`);
-      return;
+      return null;
     }
-
-    let body;
-    try { body = await res.json(); } catch {
+    try { return await res.json(); } catch {
       pullFailureCount += 1;
       console.error(`[sync] pull failed (attempt ${pullFailureCount}): unreadable response`);
-      return;
+      return null;
     }
+  }
 
-    // A successful round trip after being offline is the "internet is back" moment: say so, and
-    // push whatever queued up meanwhile right now instead of waiting for the next tick.
-    if (cloud.state === 'offline') { setCloud('ok'); setImmediate(() => pushNow()); }
+  async function pullOnce() {
+    const since = getLastPullAt(db);
+    let cursor = null;
+    let firstBody = null;
+    let lastBody = null;
+    let pages = 0;
+    let applied = 0;
+    let skippedCount = 0;
+    const changed = [];
+    // Page by page (G11): a first sync of a big shop no longer arrives as one giant response that
+    // freezes the till while it parses. An older cloud ignores limit/cursor and sends one page.
+    do {
+      const body = await fetchPullPage(since, cursor);
+      if (!body) return; // stopped part-way: the cursor is NOT advanced, so the next run starts again from `since` (every apply is idempotent)
+      firstBody = firstBody || body;
+      lastBody = body;
+      pages += 1;
 
-    // Rows already applied at this exact version during the previous (overlapping) pull are
-    // dropped here; anything new or changed since goes through as before.
-    const operations = (body.operations || []).filter(
-      (op) => !(op.updated_at && appliedInOverlap.get(overlapKey(op)) === op.updated_at)
-    );
-    if (operations.length > 0) {
+      // A successful round trip after being offline (or paused) is the "it's back" moment: say so,
+      // and push whatever queued up meanwhile right away. ('degraded' is about PUSHES failing, so only
+      // a successful push clears it, and releases the rows it had backed off.)
+      if (cloud.state === 'offline' || cloud.state === 'paused') {
+        setCloud('ok');
+        setImmediate(() => pushNow());
+      }
+
+      // Rows already applied at this exact version during the previous (overlapping) pull are
+      // dropped here; anything new or changed since goes through as before.
+      const operations = (body.operations || []).filter(
+        (op) => !(op.updated_at && appliedInOverlap.get(overlapKey(op)) === op.updated_at)
+      );
       // Applied in small chunks, yielding between them: better-sqlite3 is synchronous and shares
       // the main thread with every IPC call, so one giant transaction would freeze the till.
-      // The cursor only advances after ALL chunks, and every applyPulled* is idempotent, so a
-      // crash part-way simply re-applies the same rows next time.
       const skipped = [];
       for (let i = 0; i < operations.length; i += PULL_APPLY_CHUNK) {
         applyChunk(operations.slice(i, i + PULL_APPLY_CHUNK), skipped);
         if (i + PULL_APPLY_CHUNK < operations.length) await tick();
       }
-      lastPullSkipped = skipped.length;
-      console.log(`[sync] pulled and applied ${operations.length - skipped.length} change(s) from the cloud`);
-      onDataChanged?.(operations);
+      applied += operations.length - skipped.length;
+      skippedCount += skipped.length;
+      changed.push(...operations);
+
+      cursor = body.has_more && body.next_cursor ? body.next_cursor : null;
+      if (cursor) await tick();
+    } while (cursor && pages < MAX_PULL_PAGES);
+
+    lastPullSkipped = skippedCount;
+    if (changed.length > 0) {
+      console.log(`[sync] pulled and applied ${applied} change(s) from the cloud${pages > 1 ? ` in ${pages} pages` : ''}`);
+      onDataChanged?.(changed);
     }
-    // Cursor from the SERVER's clock, not this machine's — avoids ever
-    // missing a change because of clock skew between two computers. A cloud that sends next_since
-    // has already moved it back behind its read, so a row committed while this pull was reading
-    // comes back next time instead of being skipped forever (G4). Older clouds: server_time.
+    if (cursor) return; // hit the page safety stop: keep the old cursor, carry on next run
+
     // Which operation formats this cloud accepts (db.cloudSyncProtocol). Absent = an older cloud = 1.
-    setSetting(db, 'cloud_sync_protocol', String(Number(body.sync_protocol) || 1));
-    const cursor = body.next_since || body.server_time || new Date().toISOString();
-    setLastPullAt(db, cursor);
+    const previousProtocol = Number(getSetting(db, 'cloud_sync_protocol')) || 1;
+    const protocol = Number(lastBody.sync_protocol) || 1;
+    setSetting(db, 'cloud_sync_protocol', String(protocol));
+    if (protocol > previousProtocol) {
+      // The cloud just learned new record kinds (e.g. shifts at 3): queue what this till holds of
+      // them now, instead of waiting for the next restart's reconcile.
+      if (reconcileUnsyncedRows(db) > 0) setImmediate(() => pushNow());
+    }
+    if (protocol >= 4 && !getSetting(db, 'stock_movements_backfilled')) await backfillStockMovements();
+    // Cursor from the SERVER's clock, not this machine's. next_since (from the FIRST page, the
+    // earliest read) is already moved back behind the read, so a row committed while this pull was
+    // reading comes back next time instead of being skipped forever (G4). Older clouds: server_time.
+    const nextCursor = firstBody.next_since || firstBody.server_time || new Date().toISOString();
+    setLastPullAt(db, nextCursor);
     // What the sidebar shows as "last update from cloud": when this pull happened, not the cursor.
-    setSetting(db, 'last_pull_completed_at', body.server_time || new Date().toISOString());
+    setSetting(db, 'last_pull_completed_at', lastBody.server_time || new Date().toISOString());
     for (const [key, updatedAt] of appliedInOverlap) {
-      if (Date.parse(updatedAt) <= Date.parse(cursor)) appliedInOverlap.delete(key); // cannot come back: the next pull starts after it
+      if (Date.parse(updatedAt) <= Date.parse(nextCursor)) appliedInOverlap.delete(key); // cannot come back: the next pull starts after it
     }
     pullFailureCount = 0;
+  }
+
+  /**
+   * Once, the first time this till talks to a cloud with the stock ledger (protocol 4): fetch every
+   * damage/count/service-part movement from the beginning. The ordinary pull's cursor may already be
+   * past movements recorded while this till was still on an older version that ignored them.
+   * Each one is applied at most once (db.applyPulledStockMovement), so a repeat is harmless.
+   */
+  async function backfillStockMovements() {
+    let cursor = null;
+    let pages = 0;
+    const changed = [];
+    do {
+      const body = await fetchPullPage(null, cursor, 'stock_movement');
+      if (!body) return; // try again on the next pull
+      const skipped = [];
+      const operations = body.operations || [];
+      for (let i = 0; i < operations.length; i += PULL_APPLY_CHUNK) {
+        applyChunk(operations.slice(i, i + PULL_APPLY_CHUNK), skipped);
+        await tick();
+      }
+      changed.push(...operations);
+      pages += 1;
+      cursor = body.has_more && body.next_cursor ? body.next_cursor : null;
+    } while (cursor && pages < MAX_PULL_PAGES);
+    if (cursor) return;
+    setSetting(db, 'stock_movements_backfilled', new Date().toISOString());
+    if (changed.length > 0) onDataChanged?.(changed);
   }
 
   /** The single-flight pull. A pull requested during a push waits for it (push first, then pull). */
@@ -492,7 +595,7 @@ function startSyncEngine(db, onDataChanged) {
       return;
     }
     try {
-      ws = new WebSocket(wsUrl(token));
+      ws = new WebSocket(wsUrl(token, deviceId));
     } catch (err) {
       wsRetryTimer = setTimeout(connectWs, wsRetryDelay);
       wsRetryDelay = Math.min(wsRetryDelay * 2, 30_000);

@@ -1,17 +1,26 @@
 const crypto = require('crypto');
 const API_BASE = process.env.BENCHLINE_API_URL || 'http://localhost:8000/api';
 const { getOrCreateDeviceId } = require('./device');
-
-function getStoredTokens(db) {
-  const row = db.prepare(`SELECT value FROM app_settings WHERE key = 'auth_tokens'`).get();
-  return row ? JSON.parse(row.value) : null;
-}
+const secrets = require('./secrets');
 
 function storeTokens(db, tokens) {
   db.prepare(
     `INSERT INTO app_settings (key, value) VALUES ('auth_tokens', ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value`
-  ).run(JSON.stringify(tokens));
+  ).run(secrets.seal(JSON.stringify(tokens)));
+}
+
+/** Tokens from app_settings, decrypted (see secrets.js). A plaintext row from an older version is
+ *  re-saved encrypted the first time it is read where the OS keychain is available. */
+function getStoredTokens(db) {
+  const row = db.prepare(`SELECT value FROM app_settings WHERE key = 'auth_tokens'`).get();
+  if (!row) return null;
+  const text = secrets.unseal(row.value);
+  if (text == null) return null; // sealed on another machine/account: sign in again
+  let tokens;
+  try { tokens = JSON.parse(text); } catch { return null; }
+  if (!secrets.isSealed(row.value) && secrets.available()) storeTokens(db, tokens);
+  return tokens;
 }
 
 /**
@@ -260,6 +269,8 @@ async function login(db, username, password) {
         is_owner: me.is_owner,
         is_ceo: Boolean(me.is_ceo),
         role: me.role,
+        // Kept so the till can decide offline what this person may see (e.g. view_all_sales).
+        capabilities: me.capabilities || {},
       };
       storeUserProfile(db, profile);
       storeOfflineProfile(db, username, profile); // so THIS user's own role/name is what offline login restores later, not whoever logged in last

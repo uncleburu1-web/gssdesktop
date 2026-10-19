@@ -81,6 +81,20 @@ export default function ShiftScreen({ refreshKey, profile }) {
               <Stat label="Gross sales" value={money(current.sales.gross)} />
               {['cash', 'transfer', 'pos'].map((m) => <Stat key={m} label={`${methodLabel(m)} received`} value={money(current.payments.by_method[m])} />)}
             </div>
+            {current.cash_movements && current.cash_movements.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ fontSize: 11.5, color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '.4px', marginBottom: 4 }}>Cash in / out this shift</div>
+                {current.cash_movements.map((c, i) => (
+                  <div key={i} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, fontSize: 13, padding: '2px 0' }}>
+                    <span>{fmtDateTime(c.created_at)} · {c.kind === 'paid_in' ? 'In' : 'Out'} · {c.reason}</span>
+                    <span className="num" style={{ color: c.kind === 'paid_out' ? 'var(--danger)' : 'var(--good)' }}>{c.kind === 'paid_out' ? '-' : '+'}{money(c.amount)}</span>
+                  </div>
+                ))}
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, fontWeight: 700, marginTop: 4 }}>
+                  <span>Expected in drawer now</span><span className="num">{money(current.cash.expected)}</span>
+                </div>
+              </div>
+            )}
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               <button className="btn ghost" onClick={() => openDialog('paid_in')}>Cash in</button>
               <button className="btn ghost" onClick={() => openDialog('paid_out')}>Cash out</button>

@@ -89,6 +89,16 @@ function migrate(db) {
     if (!hasColumn('sync_queue', column)) db.exec(`ALTER TABLE sync_queue ADD COLUMN ${column} TEXT`);
   }
   backfillSyncedAt(db);
+  // Stage 3: shifts and cash movements are uploaded too. Existing ones keep synced_at NULL on
+  // purpose, so a cloud that understands them (protocol 3) receives the till's shift history once.
+  if (!hasColumn('shifts', 'synced_at')) db.exec('ALTER TABLE shifts ADD COLUMN synced_at TEXT');
+  if (!hasColumn('sales', 'seller')) {
+    // Who rang each sale up. Older sales made inside a shift get the shift's cashier; the rest stay
+    // unknown (only owners and roles allowed to see every sale see those).
+    db.exec('ALTER TABLE sales ADD COLUMN seller TEXT');
+    db.exec(`UPDATE sales SET seller = (SELECT owner FROM shifts WHERE shifts.id = sales.shift_id) WHERE seller IS NULL AND shift_id IS NOT NULL`);
+  }
+  if (!hasColumn('cash_movements', 'synced_at')) db.exec('ALTER TABLE cash_movements ADD COLUMN synced_at TEXT');
   backfillPayments(db);
 }
 
@@ -495,6 +505,7 @@ function applyPulledSale(db, entityId, operation, payload) {
     db.prepare(
       `UPDATE sales SET customer_id=?, customer_name=?, staff_name=?, payment_method=?, status=?, amount_paid=?, invoice_number=?, updated_at=?, synced_at=? WHERE id=?`
     ).run(...fields, ts, ts, entityId);
+    if (payload.seller_username) db.prepare(`UPDATE sales SET seller = ? WHERE id = ? AND seller IS NULL`).run(payload.seller_username, entityId);
   } else {
     // receipt_no is only present once the cloud stores it (older clouds leave it out: NULL, which the
     // unique index ignores). A receipt number already used by ANOTHER local sale is dropped rather than
@@ -502,10 +513,10 @@ function applyPulledSale(db, entityId, operation, payload) {
     const receiptNo = payload.receipt_no && !db.prepare(`SELECT 1 FROM sales WHERE receipt_no = ?`).get(payload.receipt_no)
       ? payload.receipt_no : null;
     db.prepare(
-      `INSERT INTO sales (id, invoice_number, receipt_no, customer_id, customer_name, staff_name, payment_method, status, amount_paid, date, created_at, updated_at, is_deleted, synced_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
+      `INSERT INTO sales (id, invoice_number, receipt_no, customer_id, customer_name, staff_name, seller, payment_method, status, amount_paid, date, created_at, updated_at, is_deleted, synced_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
     ).run(entityId, payload.invoice_number ?? null, receiptNo, payload.customer_id || null, payload.customer_name || 'Walk-in',
-      payload.staff_name || '', payload.payment_method || 'cash', payload.status || 'completed', payload.amount_paid || 0,
+      payload.staff_name || '', payload.seller_username || null, payload.payment_method || 'cash', payload.status || 'completed', payload.amount_paid || 0,
       payload.date || ts, ts, ts, ts);
   }
   if (Array.isArray(payload.payments)) mergePulledPayments(db, entityId, payload.payments, payload.status);
@@ -598,6 +609,7 @@ const PULL_HANDLERS = {
   customer: applyPulledCustomer,
   sale: applyPulledSale,
   sale_item: applyPulledSaleItem,
+  stock_movement: applyPulledStockMovement,
 };
 
 function applyPulledOperation(db, entityType, operation, payload) {
@@ -684,9 +696,9 @@ const createSale = (db) => db.transaction((input) => {
   const shift = input.cart_owner ? getOpenShift(db, input.cart_owner) : null;
 
   db.prepare(
-    `INSERT INTO sales (id, invoice_number, receipt_no, shift_id, customer_id, customer_name, staff_name, payment_method, status, amount_paid, date, created_at, updated_at, is_deleted)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
-  ).run(saleId, invoiceNumber, receiptNo, shift ? shift.id : null, input.customer_id || null, input.customer_name || 'Walk-in', input.staff_name || '', input.payment_method || 'cash', status, 0, ts, ts, ts);
+    `INSERT INTO sales (id, invoice_number, receipt_no, shift_id, customer_id, customer_name, staff_name, seller, payment_method, status, amount_paid, date, created_at, updated_at, is_deleted)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+  ).run(saleId, invoiceNumber, receiptNo, shift ? shift.id : null, input.customer_id || null, input.customer_name || 'Walk-in', input.staff_name || '', input.cart_owner || null, input.payment_method || 'cash', status, 0, ts, ts, ts);
 
   for (const item of input.items) {
     const itemId = uuid();
@@ -811,10 +823,11 @@ const addPayment = (db) => db.transaction((saleId, amount, opts = {}) => {
  * Used to load EVERY sale ever made and run two queries per sale before filtering by status in
  * JavaScript, so the history screen got slower with every sale and froze the till after a while.
  */
-function listSales(db, { status = null, limit = null, offset = 0 } = {}) {
+function listSales(db, { status = null, limit = null, offset = 0, seller = null } = {}) {
   const where = ['is_deleted = 0'];
   const params = [];
   if (status) { where.push('status = ?'); params.push(status); }
+  if (seller !== null) { where.push('seller = ?'); params.push(seller); } // a seller's own sales only
   let sql = `SELECT * FROM sales WHERE ${where.join(' AND ')} ORDER BY date DESC, rowid DESC`;
   if (limit != null) {
     sql += ' LIMIT ? OFFSET ?';
@@ -897,19 +910,29 @@ function backfillPayments(db) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Shifts and the Z-report. Local bookkeeping: nothing here is enqueued for sync (yet).
+// Shifts and the Z-report. Uploaded once the cloud understands them (sync protocol 3): the shift
+// when it opens, each cash movement, and the shift again when it closes, with its frozen Z-report.
 // ---------------------------------------------------------------------------------------------
 function getOpenShift(db, owner) {
   return db.prepare(`SELECT * FROM shifts WHERE owner = ? AND status = 'open'`).get(owner) || null;
 }
 
+/** Queue a shift-related row for upload, but only to a cloud that can take it (protocol 3+). */
+function enqueueShiftSync(db, entityType, entityId, operation, payload) {
+  if (cloudSyncProtocol(db) >= 3) enqueueSync(db, { entityType, entityId, operation, payload });
+}
+
 function openShift(db, owner, openingFloat) {
   const float = openingFloat === null || openingFloat === undefined || openingFloat === '' ? NaN : money2(openingFloat);
   if (!Number.isFinite(float) || float < 0) throw new Error('Enter the opening cash float (zero or more).');
-  if (getOpenShift(db, owner)) throw new Error('You already have a shift open. Close it before opening another.');
-  const id = uuid();
-  db.prepare(`INSERT INTO shifts (id, owner, status, opened_at, opening_float) VALUES (?, ?, 'open', ?, ?)`).run(id, owner, nowIso(), float);
-  return db.prepare(`SELECT * FROM shifts WHERE id = ?`).get(id);
+  return db.transaction(() => {
+    if (getOpenShift(db, owner)) throw new Error('You already have a shift open. Close it before opening another.');
+    const id = uuid();
+    db.prepare(`INSERT INTO shifts (id, owner, status, opened_at, opening_float) VALUES (?, ?, 'open', ?, ?)`).run(id, owner, nowIso(), float);
+    const row = db.prepare(`SELECT * FROM shifts WHERE id = ?`).get(id);
+    enqueueShiftSync(db, 'shift', id, 'create', row);
+    return row;
+  })();
 }
 
 function addCashMovement(db, owner, { kind, amount, reason } = {}) {
@@ -919,10 +942,14 @@ function addCashMovement(db, owner, { kind, amount, reason } = {}) {
   const value = money2(amount);
   if (!Number.isFinite(value) || value <= 0) throw new Error('Enter an amount greater than zero.');
   if (!String(reason || '').trim()) throw new Error('Say why: a reason is required for every cash movement.');
-  const id = uuid();
-  db.prepare(`INSERT INTO cash_movements (id, shift_id, kind, amount, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
-    .run(id, shift.id, kind, value, String(reason).trim(), nowIso());
-  return db.prepare(`SELECT * FROM cash_movements WHERE id = ?`).get(id);
+  return db.transaction(() => {
+    const id = uuid();
+    db.prepare(`INSERT INTO cash_movements (id, shift_id, kind, amount, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(id, shift.id, kind, value, String(reason).trim(), nowIso());
+    const row = db.prepare(`SELECT * FROM cash_movements WHERE id = ?`).get(id);
+    enqueueShiftSync(db, 'cash_movement', id, 'create', row);
+    return row;
+  })();
 }
 
 /** The shift's numbers, computed from the books. Open shift = live (X-report); closed = frozen copy is used instead. */
@@ -964,6 +991,8 @@ function computeShiftReport(db, shift) {
     },
     voided: { count: voided.n, paid: money2(voided.paid) },
     outstanding: { count: owing.length, balance: money2(owing.reduce((sum, s) => sum + s.balance_due, 0)) },
+    // Every cash in/out of this drawer with its reason, so the cashier sees their money movement.
+    cash_movements: db.prepare(`SELECT created_at, kind, amount, reason FROM cash_movements WHERE shift_id = ? ORDER BY created_at`).all(shift.id),
     first_receipt: built.length ? built[0].receipt_no : null,
     last_receipt: built.length ? built[built.length - 1].receipt_no : null,
   };
@@ -992,6 +1021,7 @@ function closeShift(db, owner, { countedCash, notes = '' } = {}) {
     db.prepare(
       `UPDATE shifts SET status = 'closed', closed_at = ?, counted_cash = ?, expected_cash = ?, variance = ?, z_number = ?, notes = ?, report_json = ? WHERE id = ?`
     ).run(closedAt, counted, report.cash.expected, report.cash.variance, nextZ, frozen.shift.notes, JSON.stringify(frozen), shift.id);
+    enqueueShiftSync(db, 'shift', shift.id, 'update', db.prepare(`SELECT * FROM shifts WHERE id = ?`).get(shift.id));
     return frozen;
   })();
 }
@@ -1146,11 +1176,22 @@ function reconcileUnsyncedRows(db) {
     { table: 'sale_items', entityType: 'sale_item',
       covered: `(q.entity_type = 'sale_item' AND q.entity_id = t.id) OR (q.entity_type = 'sale_doc' AND q.entity_id = t.sale_id)` },
   ];
+  if (cloudSyncProtocol(db) >= 3) {
+    // Shift history goes up once the cloud understands shifts; a shift before its cash movements.
+    tables.push(
+      { table: 'shifts', entityType: 'shift', covered: `q.entity_type = 'shift' AND q.entity_id = t.id`, noSoftDelete: true },
+      { table: 'cash_movements', entityType: 'cash_movement', covered: `q.entity_type = 'cash_movement' AND q.entity_id = t.id`, noSoftDelete: true },
+    );
+  }
+  if (cloudSyncProtocol(db) >= 4) {
+    // Damage and stock counts recorded before the cloud could take them (stage 4).
+    tables.push({ table: 'stock_docs', entityType: 'stock_movement', covered: `q.entity_type = 'stock_movement' AND q.entity_id = t.id`, noSoftDelete: true });
+  }
   let queued = 0;
-  for (const { table, entityType, covered } of tables) {
+  for (const { table, entityType, covered, noSoftDelete } of tables) {
     const orphans = db.prepare(
       `SELECT t.* FROM ${table} t
-       WHERE t.is_deleted = 0 AND t.synced_at IS NULL
+       WHERE ${noSoftDelete ? '1 = 1' : 't.is_deleted = 0'} AND t.synced_at IS NULL
          AND NOT EXISTS (SELECT 1 FROM sync_queue q WHERE ${covered})`
     ).all();
     for (const row of orphans) {
@@ -1189,8 +1230,258 @@ function backfillSyncedAt(db) {
   })();
 }
 
+// ---------------------------------------------------------------------------------------------
+// Day report: everything that happened on this till on one calendar day (local time).
+//   seller = null      everyone (owners, managers, roles allowed to see every sale) — per-seller breakdown
+//   seller = 'ada'     only what ada did: her sales, payments she took, her cash in/out and shifts
+// Computed fresh from the local books each time; printed on the receipt printer.
+// ---------------------------------------------------------------------------------------------
+function dayBounds(date) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ''));
+  if (!m) throw new Error('Pick a day for the report.');
+  const start = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  const end = new Date(start); end.setDate(end.getDate() + 1);
+  return [start.toISOString(), end.toISOString()];
+}
+
+function getDayReport(db, { date, seller = null } = {}) {
+  const [from, to] = dayBounds(date);
+  const who = (s) => s.seller || s.staff_name || 'Unknown';
+
+  const saleRows = db.prepare(
+    `SELECT * FROM sales WHERE date >= ? AND date < ? AND is_deleted = 0 ${seller !== null ? 'AND seller = ?' : ''} ORDER BY date, rowid`
+  ).all(...(seller !== null ? [from, to, seller] : [from, to]));
+  const items = loadItemsBySale(db, saleRows.map((r) => r.id));
+  const sales = saleRows.map((r) => buildSale(r, items.get(r.id) || []));
+  const voided = db.prepare(
+    `SELECT COUNT(*) AS n, COALESCE(SUM(amount_paid), 0) AS paid FROM sales WHERE date >= ? AND date < ? AND is_deleted = 1 ${seller !== null ? 'AND seller = ?' : ''}`
+  ).get(...(seller !== null ? [from, to, seller] : [from, to]));
+
+  // Money received today, whenever the sale was made (an installment collected today counts today).
+  // Who took it: the cashier whose shift it was paid in, otherwise whoever made the sale.
+  const payments = db.prepare(
+    `SELECT p.method, p.amount, COALESCE(sh.owner, s.seller, s.staff_name, 'Unknown') AS taken_by
+       FROM sale_payments p JOIN sales s ON s.id = p.sale_id LEFT JOIN shifts sh ON sh.id = p.shift_id
+      WHERE p.paid_at >= ? AND p.paid_at < ? AND p.is_deleted = 0 AND s.is_deleted = 0`
+  ).all(from, to).filter((p) => seller === null || p.taken_by === seller);
+  const byMethod = { cash: 0, transfer: 0, pos: 0, other: 0 };
+  for (const p of payments) byMethod[p.method in byMethod ? p.method : 'other'] += p.amount;
+  for (const k of Object.keys(byMethod)) byMethod[k] = money2(byMethod[k]);
+
+  const cashMoves = db.prepare(
+    `SELECT c.created_at, c.kind, c.amount, c.reason, sh.owner FROM cash_movements c JOIN shifts sh ON sh.id = c.shift_id
+      WHERE c.created_at >= ? AND c.created_at < ? ${seller !== null ? 'AND sh.owner = ?' : ''} ORDER BY c.created_at`
+  ).all(...(seller !== null ? [from, to, seller] : [from, to]));
+
+  const shifts = db.prepare(
+    `SELECT owner, status, opened_at, closed_at, z_number, opening_float, expected_cash, counted_cash, variance FROM shifts
+      WHERE ((opened_at >= ? AND opened_at < ?) OR (closed_at >= ? AND closed_at < ?)) ${seller !== null ? 'AND owner = ?' : ''}
+      ORDER BY opened_at`
+  ).all(...(seller !== null ? [from, to, from, to, seller] : [from, to, from, to]));
+
+  const stockChanges = db.prepare(
+    `SELECT m.created_at, m.kind, SUM(m.quantity) AS quantity, m.reason, m.actor, p.name AS product_name
+       FROM stock_movements m LEFT JOIN products p ON p.id = m.product_id
+      WHERE m.created_at >= ? AND m.created_at < ? AND m.kind IN ('damage', 'adjustment') ${seller !== null ? 'AND m.actor = ?' : ''}
+      GROUP BY COALESCE(m.doc_id, m.id) ORDER BY m.created_at`
+  ).all(...(seller !== null ? [from, to, seller] : [from, to]));
+
+  const itemTotals = new Map();
+  for (const sale of sales) {
+    for (const it of sale.items) {
+      const row = itemTotals.get(it.item_name) || { name: it.item_name, quantity: 0, total: 0 };
+      row.quantity += Number(it.quantity) || 0;
+      row.total = money2(row.total + it.total);
+      itemTotals.set(it.item_name, row);
+    }
+  }
+
+  let bySeller = null;
+  if (seller === null) {
+    const map = new Map();
+    const entry = (name) => map.get(name) || map.set(name, { seller: name, sales: 0, total: 0, received: 0 }).get(name);
+    for (const sale of sales) { const e = entry(who(sale)); e.sales += 1; e.total = money2(e.total + sale.total); }
+    for (const p of payments) { const e = entry(p.taken_by); e.received = money2(e.received + p.amount); }
+    bySeller = [...map.values()].sort((a, b) => b.total - a.total);
+  }
+
+  const owing = sales.filter((x) => x.status === 'outstanding');
+  const paidIn = money2(cashMoves.filter((c) => c.kind === 'paid_in').reduce((t, c) => t + c.amount, 0));
+  const paidOut = money2(cashMoves.filter((c) => c.kind === 'paid_out').reduce((t, c) => t + c.amount, 0));
+  return {
+    date,
+    scope: seller === null ? 'everyone' : 'seller',
+    seller,
+    generated_at: nowIso(),
+    sales: {
+      count: sales.length,
+      gross: money2(sales.reduce((t, x) => t + x.total, 0)),
+      discounts: money2(sales.reduce((t, x) => t + x.items.reduce((d, i) => d + Number(i.discount || 0), 0), 0)),
+      items_sold: sales.reduce((t, x) => t + x.items.reduce((q, i) => q + (Number(i.quantity) || 0), 0), 0),
+      // Profit is owner information: only on the everyone report.
+      profit: seller === null ? money2(sales.reduce((t, x) => t + x.profit, 0)) : null,
+    },
+    outstanding: { count: owing.length, balance: money2(owing.reduce((t, x) => t + x.balance_due, 0)) },
+    voided: { count: voided.n, paid: money2(voided.paid) },
+    payments: { total: money2(Object.values(byMethod).reduce((t, v) => t + v, 0)), by_method: byMethod },
+    cash: { paid_in: paidIn, paid_out: paidOut, movements: cashMoves },
+    shifts,
+    stock_changes: stockChanges,
+    top_items: [...itemTotals.values()].sort((a, b) => b.quantity - a.quantity).slice(0, 10),
+    by_seller: bySeller,
+    sellers: seller === null
+      ? db.prepare(`SELECT DISTINCT seller FROM sales WHERE seller IS NOT NULL UNION SELECT DISTINCT owner FROM shifts ORDER BY 1`).all().map((r) => r.seller)
+      : [seller],
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stock ledger (stage 4): damage write-offs and stock counts.
+//   damage      any signed-in worker, reason required, never more than is in stock
+//   adjustment  owners only (checked in main.js AND by the cloud), reason required
+// The till applies the change to its own batches immediately (it must work offline) and queues
+// ONE 'stock_movement' document for the cloud, which applies the same rule to its own stock.
+// ---------------------------------------------------------------------------------------------
+function wholeQuantity(value, label) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) throw new Error(`${label} must be a number.`);
+  if (!Number.isInteger(n)) throw new Error(`${label} must be a whole number for this product.`);
+  return n;
+}
+
+function liveBatchesFefo(db, productId) {
+  return db.prepare(
+    `SELECT * FROM stock_batches WHERE product_id = ? AND is_deleted = 0
+     ORDER BY (expiry_date IS NULL), expiry_date, received_date`
+  ).all(productId);
+}
+
+function insertLocalMovement(db, { docId, productId, batchId, kind, quantity, reason, actor, at }) {
+  db.prepare(
+    `INSERT INTO stock_movements (id, doc_id, product_id, batch_id, kind, quantity, reason, actor, origin, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'local', ?)`
+  ).run(uuid(), docId, productId, batchId, kind, quantity, reason, actor, at);
+}
+
+function takeFefo(db, productId, quantity, meta) {
+  let remaining = quantity;
+  for (const batch of liveBatchesFefo(db, productId)) {
+    if (remaining <= 0) break;
+    if (batch.quantity_remaining <= 0) continue;
+    const take = Math.min(batch.quantity_remaining, remaining);
+    db.prepare(`UPDATE stock_batches SET quantity_remaining = quantity_remaining - ?, updated_at = ? WHERE id = ?`).run(take, meta.at, batch.id);
+    insertLocalMovement(db, { ...meta, productId, batchId: batch.id, quantity: -take });
+    remaining -= take;
+  }
+}
+
+function enqueueStockDoc(db, doc) {
+  if (cloudSyncProtocol(db) >= 4) enqueueSync(db, { entityType: 'stock_movement', entityId: doc.id, operation: 'create', payload: doc });
+}
+
+function recordDamage(db, { product_id, quantity, reason } = {}) {
+  const why = String(reason || '').trim();
+  if (!why) throw new Error('Say why the stock is damaged — a reason is required.');
+  const qty = wholeQuantity(quantity, 'Quantity');
+  if (qty <= 0) throw new Error('Quantity must be more than zero.');
+  return db.transaction(() => {
+    const product = db.prepare(`SELECT id, name FROM products WHERE id = ? AND is_deleted = 0`).get(product_id);
+    if (!product) throw new Error('Product not found.');
+    const available = liveBatchesFefo(db, product_id).reduce((s, b) => s + b.quantity_remaining, 0);
+    if (qty > available) throw new Error(`Only ${available} of ${product.name} in stock — cannot write off ${qty}.`);
+    const doc = { id: uuid(), kind: 'damage', product_id, quantity: qty, system_quantity: null, counted_quantity: null,
+      reason: why, actor: currentActor(db), created_at: nowIso() };
+    db.prepare(
+      `INSERT INTO stock_docs (id, kind, product_id, quantity, reason, actor, created_at) VALUES (?, 'damage', ?, ?, ?, ?, ?)`
+    ).run(doc.id, product_id, qty, why, doc.actor, doc.created_at);
+    takeFefo(db, product_id, qty, { docId: doc.id, kind: 'damage', reason: why, actor: doc.actor, at: doc.created_at });
+    enqueueStockDoc(db, doc);
+    return { ...doc, product: getProduct(db, product_id) };
+  })();
+}
+
+function recordStockCount(db, { product_id, counted_quantity, reason } = {}) {
+  const why = String(reason || '').trim();
+  if (!why) throw new Error('Say why the count differs — a reason is required.');
+  const counted = wholeQuantity(counted_quantity, 'Counted quantity');
+  if (counted < 0) throw new Error('Counted quantity cannot be negative.');
+  return db.transaction(() => {
+    const product = db.prepare(`SELECT id FROM products WHERE id = ? AND is_deleted = 0`).get(product_id);
+    if (!product) throw new Error('Product not found.');
+    const batches = liveBatchesFefo(db, product_id);
+    const system = batches.reduce((s, b) => s + b.quantity_remaining, 0);
+    const diff = counted - system;
+    if (diff === 0) return { unchanged: true, product: getProduct(db, product_id) };
+    const at = nowIso();
+    const doc = { id: uuid(), kind: 'adjustment', product_id, quantity: null, system_quantity: system, counted_quantity: counted,
+      reason: why, actor: currentActor(db), created_at: at };
+    db.prepare(
+      `INSERT INTO stock_docs (id, kind, product_id, system_quantity, counted_quantity, reason, actor, created_at)
+       VALUES (?, 'adjustment', ?, ?, ?, ?, ?, ?)`
+    ).run(doc.id, product_id, system, counted, why, doc.actor, at);
+    const meta = { docId: doc.id, kind: 'adjustment', reason: why, actor: doc.actor, at };
+    if (diff < 0) {
+      takeFefo(db, product_id, -diff, meta);
+    } else {
+      // Surplus goes on the newest batch, as on the cloud. With no batch at all, a local one is
+      // created; it is NOT uploaded as a batch (the cloud makes its own when it applies the count).
+      let target = batches.slice().sort((a, b) => String(b.received_date).localeCompare(String(a.received_date)))[0];
+      if (!target) {
+        const id = uuid();
+        db.prepare(
+          `INSERT INTO stock_batches (id, product_id, batch_number, quantity_received, quantity_remaining, cost_price, expiry_date, received_date, created_at, updated_at, is_deleted, synced_at)
+           VALUES (?, ?, 'COUNT', 0, 0, 0, NULL, ?, ?, ?, 0, ?)`
+        ).run(id, product_id, at, at, at, at);
+        target = { id };
+      }
+      db.prepare(`UPDATE stock_batches SET quantity_remaining = quantity_remaining + ?, updated_at = ? WHERE id = ?`).run(diff, at, target.id);
+      insertLocalMovement(db, { ...meta, productId: product_id, batchId: target.id, quantity: diff });
+    }
+    enqueueStockDoc(db, doc);
+    return { ...doc, product: getProduct(db, product_id) };
+  })();
+}
+
+function listStockMovements(db, { productId = null, actor = null, from = null, to = null, limit = 500 } = {}) {
+  const where = [];
+  const args = [];
+  if (productId) { where.push('m.product_id = ?'); args.push(productId); }
+  if (actor) { where.push('m.actor = ?'); args.push(actor); }
+  if (from) { where.push('m.created_at >= ?'); args.push(from); }
+  if (to) { where.push('m.created_at < ?'); args.push(to); }
+  return db.prepare(
+    `SELECT m.*, p.name AS product_name FROM stock_movements m LEFT JOIN products p ON p.id = m.product_id
+     ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY m.created_at DESC LIMIT ?`
+  ).all(...args, limit);
+}
+
+/**
+ * A movement the cloud recorded (damage/count/service part done on the web, Android or another
+ * till). Applied to this till's batch exactly once: skipped if already here, or if it is the
+ * cloud's copy of a document THIS till recorded (client_ref = our stock_docs id).
+ */
+function applyPulledStockMovement(db, entityId, operation, payload) {
+  if (operation === 'delete') return;
+  if (db.prepare(`SELECT 1 FROM stock_movements WHERE id = ?`).get(entityId)) return;
+  if (payload.client_ref && db.prepare(`SELECT 1 FROM stock_docs WHERE id = ?`).get(payload.client_ref)) return;
+  const quantity = Number(payload.quantity) || 0;
+  const batch = payload.batch_id ? db.prepare(`SELECT id, quantity_remaining FROM stock_batches WHERE id = ?`).get(payload.batch_id) : null;
+  if (batch && quantity !== 0) {
+    const next = Math.max(0, batch.quantity_remaining + quantity);
+    db.prepare(`UPDATE stock_batches SET quantity_remaining = ?, updated_at = ? WHERE id = ?`).run(next, nowIso(), batch.id);
+  }
+  db.prepare(
+    `INSERT INTO stock_movements (id, doc_id, product_id, batch_id, kind, quantity, reason, actor, origin, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'cloud', ?)`
+  ).run(entityId, payload.client_ref || null, payload.product_id, payload.batch_id || null, payload.kind, quantity,
+    payload.reason || '', payload.actor_name || null, payload.created_at || nowIso());
+}
+
 // Which local rows an acknowledged outbox row stands for (sale_payment rows have no synced_at column).
-const ACK_TABLES = { product: 'products', stock_batch: 'stock_batches', customer: 'customers', sale: 'sales', sale_item: 'sale_items' };
+const ACK_TABLES = {
+  product: 'products', stock_batch: 'stock_batches', customer: 'customers', sale: 'sales', sale_item: 'sale_items',
+  shift: 'shifts', cash_movement: 'cash_movements', stock_movement: 'stock_docs',
+};
 
 /** The cloud confirmed this outbox row: stamp synced_at on the local row(s) it carried. */
 function markEntitySynced(db, entityType, entityId, at) {
@@ -1221,6 +1512,10 @@ module.exports = {
   listSales,
   getSale,
   applyPulledOperation,
+  recordDamage,
+  getDayReport,
+  recordStockCount,
+  listStockMovements,
   getLastPullAt,
   setLastPullAt,
   getSetting,

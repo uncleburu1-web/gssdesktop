@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS shifts (
   variance REAL,
   z_number INTEGER,
   notes TEXT NOT NULL DEFAULT '',
-  report_json TEXT
+  report_json TEXT,
+  synced_at TEXT                   -- when the cloud confirmed it (stage 3); NULL = not uploaded yet
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_shift_per_owner ON shifts(owner) WHERE status = 'open';
 CREATE INDEX IF NOT EXISTS idx_shifts_opened ON shifts(opened_at);
@@ -56,9 +57,44 @@ CREATE TABLE IF NOT EXISTS cash_movements (
   kind TEXT NOT NULL,
   amount REAL NOT NULL,
   reason TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  synced_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_cash_movements_shift ON cash_movements(shift_id);
+
+-- Stock ledger (stage 4). One row per batch a change touched, append-only.
+--   origin 'local': recorded on THIS till (doc_id = the stock_docs row that went to the cloud)
+--   origin 'cloud': pulled from the cloud (damage/count/service parts done elsewhere), applied once
+-- Sales and receipts are not repeated here: they already live in sales/sale_allocations/stock_batches.
+CREATE TABLE IF NOT EXISTS stock_movements (
+  id TEXT PRIMARY KEY,
+  doc_id TEXT,
+  product_id TEXT NOT NULL,
+  batch_id TEXT,
+  kind TEXT NOT NULL,
+  quantity REAL NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  actor TEXT,
+  origin TEXT NOT NULL DEFAULT 'local',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_stock_movements_product ON stock_movements(product_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_stock_movements_doc ON stock_movements(doc_id);
+
+-- One damage write-off or stock count recorded on this till: the unit that is uploaded
+-- (entity 'stock_movement', protocol 4). Its id travels as the cloud movements' client_ref.
+CREATE TABLE IF NOT EXISTS stock_docs (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,              -- 'damage' | 'adjustment'
+  product_id TEXT NOT NULL,
+  quantity REAL,                   -- damage: how many written off
+  system_quantity REAL,            -- count: what the till thought it had
+  counted_quantity REAL,           -- count: what was physically there
+  reason TEXT NOT NULL,
+  actor TEXT,
+  created_at TEXT NOT NULL,
+  synced_at TEXT
+);
 
 -- The cashier's unfinished work. LOCAL SCRATCH SPACE: never synced, never part of the books.
 --   status 'draft'  : the cart currently on screen, saved continuously, so a crash or power cut
@@ -135,6 +171,7 @@ CREATE TABLE IF NOT EXISTS sales (
   customer_id TEXT REFERENCES customers(id),
   customer_name TEXT DEFAULT 'Walk-in',
   staff_name TEXT,
+  seller TEXT,                     -- username of who rang it up (sellers see only their own sales)
   payment_method TEXT NOT NULL DEFAULT 'cash',
   status TEXT NOT NULL DEFAULT 'completed',
   amount_paid REAL NOT NULL DEFAULT 0,

@@ -29,6 +29,9 @@ fs.copyFileSync(source, copy);
 for (const ext of ['-wal', '-shm']) if (fs.existsSync(source + ext)) fs.copyFileSync(source + ext, copy + ext);
 
 const one = (db, sql) => db.prepare(sql).get().n;
+// Tables a till may not have yet (it predates them): 0 rows, not an error.
+const countIfTable = (db, table) => (db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(table)
+  ? one(db, `SELECT COUNT(*) AS n FROM ${table}`) : 0);
 const snapshot = (db) => ({
   sales: one(db, `SELECT COUNT(*) AS n FROM sales WHERE is_deleted = 0`),
   deletedSales: one(db, `SELECT COUNT(*) AS n FROM sales WHERE is_deleted = 1`),
@@ -40,6 +43,9 @@ const snapshot = (db) => ({
   waiting: one(db, `SELECT COUNT(*) AS n FROM sync_queue WHERE status = 'pending'`),
   failed: one(db, `SELECT COUNT(*) AS n FROM sync_queue WHERE status = 'failed'`),
   invoices: one(db, `SELECT COALESCE(MAX(invoice_number), 0) AS n FROM sales`),
+  shifts: countIfTable(db, 'shifts'),
+  cashMovements: countIfTable(db, 'cash_movements'),
+  stockDocs: countIfTable(db, 'stock_docs'),
 });
 
 // Fingerprint of every queued change: id + what it says. The upgrade must not alter a single one.
@@ -66,6 +72,7 @@ console.log(`Before: ${before.sales} sales, ₦${before.moneyTaken} taken, ${bef
 console.log('Nothing may change:');
 same('sales', 'sales'); same('deletedSales', 'deleted sales'); same('saleItems', 'sale lines'); same('moneyTaken', 'money taken');
 same('products', 'products'); same('customers', 'customers'); same('stock', 'stock on hand');
+same('shifts', 'shifts'); same('cashMovements', 'cash movements');
 same('waiting', 'changes waiting to sync'); same('failed', 'failed changes (still there, still visible)'); same('invoices', 'invoice numbering');
 
 console.log('\nWhat must now be true:');

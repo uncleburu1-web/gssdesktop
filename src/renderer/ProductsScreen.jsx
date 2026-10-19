@@ -7,6 +7,11 @@ export default function ProductsScreen({ refreshKey, isOwner, profile }) {
   const [loading, setLoading] = useState(true);
   const [addOpen, setAddOpen] = useState(false);
   const [stockOpen, setStockOpen] = useState(null); // product being restocked
+  const [damageOpen, setDamageOpen] = useState(null); // product being written off
+  const [countOpen, setCountOpen] = useState(null); // product being counted (owners)
+  const [historyOpen, setHistoryOpen] = useState(null); // product whose stock history is shown
+  const [history, setHistory] = useState([]);
+  const [changeForm, setChangeForm] = useState({ quantity: '', reason: '' });
   const [error, setError] = useState('');
 
   // Scoped to this till's business type (falls back to just "Other" if
@@ -67,6 +72,56 @@ export default function ProductsScreen({ refreshKey, isOwner, profile }) {
     }
   }
 
+  function openChange(setter, product, quantity = '') {
+    setError('');
+    setChangeForm({ quantity, reason: '' });
+    setter(product);
+  }
+
+  async function handleDamage(e) {
+    e.preventDefault();
+    if (submitting) return;
+    setSubmitting(true);
+    setError('');
+    try {
+      await window.pos.recordDamage({ product_id: damageOpen.id, quantity: Number(changeForm.quantity), reason: changeForm.reason });
+      setDamageOpen(null);
+      load();
+    } catch (err) {
+      setError(posErrorMessage(err, 'Could not record the damage.'));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleCount(e) {
+    e.preventDefault();
+    if (submitting) return;
+    setSubmitting(true);
+    setError('');
+    try {
+      await window.pos.recordStockCount({ product_id: countOpen.id, counted_quantity: Number(changeForm.quantity), reason: changeForm.reason });
+      setCountOpen(null);
+      load();
+    } catch (err) {
+      setError(posErrorMessage(err, 'Could not save the count.'));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function showHistory(product) {
+    setHistoryOpen(product);
+    setHistory([]);
+    try {
+      setHistory(await window.pos.listStockMovements({ productId: product.id }));
+    } catch (err) {
+      setError(posErrorMessage(err, 'Could not load the stock history.'));
+    }
+  }
+
+  const KIND_LABEL = { damage: 'Damaged', adjustment: 'Count adjustment', repair_part: 'Used on service job', repair_part_return: 'Returned from service job', return: 'Customer return', transfer: 'Transfer' };
+
   return (
     <div className="section">
       <div className="section-head" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -83,7 +138,7 @@ export default function ProductsScreen({ refreshKey, isOwner, profile }) {
           <div style={{ overflowX: 'auto' }}>
             <table>
               <thead>
-                <tr><th>Name</th><th>Barcode</th><th>Category</th><th>Stock</th><th>Cost price</th><th>Sell price</th>{isOwner && <th></th>}</tr>
+                <tr><th>Name</th><th>Barcode</th><th>Category</th><th>Stock</th><th>Cost price</th><th>Sell price</th><th></th></tr>
               </thead>
               <tbody>
                 {products.map((p) => (
@@ -94,7 +149,12 @@ export default function ProductsScreen({ refreshKey, isOwner, profile }) {
                     <td className="num" style={{ color: p.quantity <= p.min_stock ? 'var(--warn)' : undefined }}>{p.quantity}</td>
                     <td className="num">{money(p.cost_price)}</td>
                     <td className="num">{money(p.sell_price)}</td>
-                    {isOwner && <td><button className="btn ghost small" onClick={() => setStockOpen(p)}>+ Stock</button></td>}
+                    <td style={{ whiteSpace: 'nowrap' }}>
+                      {isOwner && <button className="btn ghost small" onClick={() => setStockOpen(p)}>+ Stock</button>}
+                      <button className="btn ghost small" onClick={() => openChange(setDamageOpen, p)} disabled={!p.quantity}>Damage</button>
+                      {isOwner && <button className="btn ghost small" onClick={() => openChange(setCountOpen, p, String(p.quantity))}>Count</button>}
+                      <button className="btn ghost small" onClick={() => showHistory(p)}>History</button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -165,6 +225,81 @@ export default function ProductsScreen({ refreshKey, isOwner, profile }) {
                 <button type="submit" className="btn" disabled={submitting}>{submitting ? 'Adding…' : 'Add stock'}</button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {damageOpen && (
+        <div className="modal-backdrop" onClick={() => setDamageOpen(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>Record damage — {damageOpen.name}</h3>
+            <p className="page-sub" style={{ marginTop: 0 }}>In stock: {damageOpen.quantity}. Damaged, expired or missing stock comes off now; the owner sees who recorded it and why.</p>
+            <form onSubmit={handleDamage}>
+              <div className="field">
+                <label>Quantity damaged</label>
+                <input required autoFocus type="number" min="1" step="1" max={damageOpen.quantity} value={changeForm.quantity} onChange={(e) => setChangeForm({ ...changeForm, quantity: e.target.value })} />
+              </div>
+              <div className="field">
+                <label>Reason (required)</label>
+                <input required value={changeForm.reason} onChange={(e) => setChangeForm({ ...changeForm, reason: e.target.value })} placeholder="e.g. Bottles broke when the shelf fell" />
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="btn ghost" onClick={() => setDamageOpen(null)}>Cancel</button>
+                <button type="submit" className="btn" disabled={submitting || !changeForm.reason.trim()}>{submitting ? 'Saving…' : 'Write off'}</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {countOpen && (
+        <div className="modal-backdrop" onClick={() => setCountOpen(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>Stock count — {countOpen.name}</h3>
+            <p className="page-sub" style={{ marginTop: 0 }}>The till says {countOpen.quantity}. Enter what is physically on the shelf; the difference is recorded with your name and reason.</p>
+            <form onSubmit={handleCount}>
+              <div className="field">
+                <label>Counted quantity</label>
+                <input required autoFocus type="number" min="0" step="1" value={changeForm.quantity} onChange={(e) => setChangeForm({ ...changeForm, quantity: e.target.value })} />
+              </div>
+              <div className="field">
+                <label>Reason (required)</label>
+                <input required value={changeForm.reason} onChange={(e) => setChangeForm({ ...changeForm, reason: e.target.value })} placeholder="e.g. Month-end count" />
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="btn ghost" onClick={() => setCountOpen(null)}>Cancel</button>
+                <button type="submit" className="btn" disabled={submitting || !changeForm.reason.trim()}>{submitting ? 'Saving…' : 'Save count'}</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {historyOpen && (
+        <div className="modal-backdrop" onClick={() => setHistoryOpen(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 620 }}>
+            <h3>Stock changes — {historyOpen.name}</h3>
+            {history.length === 0 ? (
+              <div className="empty">No damage or count adjustments recorded{isOwner ? '' : ' by you'}.</div>
+            ) : (
+              <div style={{ maxHeight: 360, overflowY: 'auto' }}>
+                <table>
+                  <thead><tr><th>When</th><th>What</th><th>Qty</th><th>Who</th><th>Reason</th></tr></thead>
+                  <tbody>
+                    {history.map((m) => (
+                      <tr key={m.id}>
+                        <td>{new Date(m.created_at).toLocaleString()}</td>
+                        <td>{KIND_LABEL[m.kind] || m.kind}</td>
+                        <td className="num">{m.quantity > 0 ? `+${m.quantity}` : m.quantity}</td>
+                        <td>{m.actor || '—'}</td>
+                        <td>{m.reason}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <div className="modal-actions"><button className="btn ghost" onClick={() => setHistoryOpen(null)}>Close</button></div>
           </div>
         </div>
       )}
