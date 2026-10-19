@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS shifts (
   variance REAL,
   z_number INTEGER,
   notes TEXT NOT NULL DEFAULT '',
-  report_json TEXT
+  report_json TEXT,
+  synced_at TEXT                   -- when the cloud confirmed it (stage 3); NULL = not uploaded yet
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_shift_per_owner ON shifts(owner) WHERE status = 'open';
 CREATE INDEX IF NOT EXISTS idx_shifts_opened ON shifts(opened_at);
@@ -56,7 +57,8 @@ CREATE TABLE IF NOT EXISTS cash_movements (
   kind TEXT NOT NULL,
   amount REAL NOT NULL,
   reason TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  synced_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_cash_movements_shift ON cash_movements(shift_id);
 

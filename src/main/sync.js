@@ -410,7 +410,14 @@ function startSyncEngine(db, onDataChanged) {
     if (cursor) return; // hit the page safety stop: keep the old cursor, carry on next run
 
     // Which operation formats this cloud accepts (db.cloudSyncProtocol). Absent = an older cloud = 1.
-    setSetting(db, 'cloud_sync_protocol', String(Number(lastBody.sync_protocol) || 1));
+    const previousProtocol = Number(getSetting(db, 'cloud_sync_protocol')) || 1;
+    const protocol = Number(lastBody.sync_protocol) || 1;
+    setSetting(db, 'cloud_sync_protocol', String(protocol));
+    if (protocol > previousProtocol) {
+      // The cloud just learned new record kinds (e.g. shifts at 3): queue what this till holds of
+      // them now, instead of waiting for the next restart's reconcile.
+      if (reconcileUnsyncedRows(db) > 0) setImmediate(() => pushNow());
+    }
     // Cursor from the SERVER's clock, not this machine's. next_since (from the FIRST page, the
     // earliest read) is already moved back behind the read, so a row committed while this pull was
     // reading comes back next time instead of being skipped forever (G4). Older clouds: server_time.

@@ -89,6 +89,10 @@ function migrate(db) {
     if (!hasColumn('sync_queue', column)) db.exec(`ALTER TABLE sync_queue ADD COLUMN ${column} TEXT`);
   }
   backfillSyncedAt(db);
+  // Stage 3: shifts and cash movements are uploaded too. Existing ones keep synced_at NULL on
+  // purpose, so a cloud that understands them (protocol 3) receives the till's shift history once.
+  if (!hasColumn('shifts', 'synced_at')) db.exec('ALTER TABLE shifts ADD COLUMN synced_at TEXT');
+  if (!hasColumn('cash_movements', 'synced_at')) db.exec('ALTER TABLE cash_movements ADD COLUMN synced_at TEXT');
   backfillPayments(db);
 }
 
@@ -897,19 +901,29 @@ function backfillPayments(db) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Shifts and the Z-report. Local bookkeeping: nothing here is enqueued for sync (yet).
+// Shifts and the Z-report. Uploaded once the cloud understands them (sync protocol 3): the shift
+// when it opens, each cash movement, and the shift again when it closes, with its frozen Z-report.
 // ---------------------------------------------------------------------------------------------
 function getOpenShift(db, owner) {
   return db.prepare(`SELECT * FROM shifts WHERE owner = ? AND status = 'open'`).get(owner) || null;
 }
 
+/** Queue a shift-related row for upload, but only to a cloud that can take it (protocol 3+). */
+function enqueueShiftSync(db, entityType, entityId, operation, payload) {
+  if (cloudSyncProtocol(db) >= 3) enqueueSync(db, { entityType, entityId, operation, payload });
+}
+
 function openShift(db, owner, openingFloat) {
   const float = openingFloat === null || openingFloat === undefined || openingFloat === '' ? NaN : money2(openingFloat);
   if (!Number.isFinite(float) || float < 0) throw new Error('Enter the opening cash float (zero or more).');
-  if (getOpenShift(db, owner)) throw new Error('You already have a shift open. Close it before opening another.');
-  const id = uuid();
-  db.prepare(`INSERT INTO shifts (id, owner, status, opened_at, opening_float) VALUES (?, ?, 'open', ?, ?)`).run(id, owner, nowIso(), float);
-  return db.prepare(`SELECT * FROM shifts WHERE id = ?`).get(id);
+  return db.transaction(() => {
+    if (getOpenShift(db, owner)) throw new Error('You already have a shift open. Close it before opening another.');
+    const id = uuid();
+    db.prepare(`INSERT INTO shifts (id, owner, status, opened_at, opening_float) VALUES (?, ?, 'open', ?, ?)`).run(id, owner, nowIso(), float);
+    const row = db.prepare(`SELECT * FROM shifts WHERE id = ?`).get(id);
+    enqueueShiftSync(db, 'shift', id, 'create', row);
+    return row;
+  })();
 }
 
 function addCashMovement(db, owner, { kind, amount, reason } = {}) {
@@ -919,10 +933,14 @@ function addCashMovement(db, owner, { kind, amount, reason } = {}) {
   const value = money2(amount);
   if (!Number.isFinite(value) || value <= 0) throw new Error('Enter an amount greater than zero.');
   if (!String(reason || '').trim()) throw new Error('Say why: a reason is required for every cash movement.');
-  const id = uuid();
-  db.prepare(`INSERT INTO cash_movements (id, shift_id, kind, amount, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
-    .run(id, shift.id, kind, value, String(reason).trim(), nowIso());
-  return db.prepare(`SELECT * FROM cash_movements WHERE id = ?`).get(id);
+  return db.transaction(() => {
+    const id = uuid();
+    db.prepare(`INSERT INTO cash_movements (id, shift_id, kind, amount, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(id, shift.id, kind, value, String(reason).trim(), nowIso());
+    const row = db.prepare(`SELECT * FROM cash_movements WHERE id = ?`).get(id);
+    enqueueShiftSync(db, 'cash_movement', id, 'create', row);
+    return row;
+  })();
 }
 
 /** The shift's numbers, computed from the books. Open shift = live (X-report); closed = frozen copy is used instead. */
@@ -992,6 +1010,7 @@ function closeShift(db, owner, { countedCash, notes = '' } = {}) {
     db.prepare(
       `UPDATE shifts SET status = 'closed', closed_at = ?, counted_cash = ?, expected_cash = ?, variance = ?, z_number = ?, notes = ?, report_json = ? WHERE id = ?`
     ).run(closedAt, counted, report.cash.expected, report.cash.variance, nextZ, frozen.shift.notes, JSON.stringify(frozen), shift.id);
+    enqueueShiftSync(db, 'shift', shift.id, 'update', db.prepare(`SELECT * FROM shifts WHERE id = ?`).get(shift.id));
     return frozen;
   })();
 }
@@ -1146,11 +1165,18 @@ function reconcileUnsyncedRows(db) {
     { table: 'sale_items', entityType: 'sale_item',
       covered: `(q.entity_type = 'sale_item' AND q.entity_id = t.id) OR (q.entity_type = 'sale_doc' AND q.entity_id = t.sale_id)` },
   ];
+  if (cloudSyncProtocol(db) >= 3) {
+    // Shift history goes up once the cloud understands shifts; a shift before its cash movements.
+    tables.push(
+      { table: 'shifts', entityType: 'shift', covered: `q.entity_type = 'shift' AND q.entity_id = t.id`, noSoftDelete: true },
+      { table: 'cash_movements', entityType: 'cash_movement', covered: `q.entity_type = 'cash_movement' AND q.entity_id = t.id`, noSoftDelete: true },
+    );
+  }
   let queued = 0;
-  for (const { table, entityType, covered } of tables) {
+  for (const { table, entityType, covered, noSoftDelete } of tables) {
     const orphans = db.prepare(
       `SELECT t.* FROM ${table} t
-       WHERE t.is_deleted = 0 AND t.synced_at IS NULL
+       WHERE ${noSoftDelete ? '1 = 1' : 't.is_deleted = 0'} AND t.synced_at IS NULL
          AND NOT EXISTS (SELECT 1 FROM sync_queue q WHERE ${covered})`
     ).all();
     for (const row of orphans) {
@@ -1190,7 +1216,10 @@ function backfillSyncedAt(db) {
 }
 
 // Which local rows an acknowledged outbox row stands for (sale_payment rows have no synced_at column).
-const ACK_TABLES = { product: 'products', stock_batch: 'stock_batches', customer: 'customers', sale: 'sales', sale_item: 'sale_items' };
+const ACK_TABLES = {
+  product: 'products', stock_batch: 'stock_batches', customer: 'customers', sale: 'sales', sale_item: 'sale_items',
+  shift: 'shifts', cash_movement: 'cash_movements',
+};
 
 /** The cloud confirmed this outbox row: stamp synced_at on the local row(s) it carried. */
 function markEntitySynced(db, entityType, entityId, at) {
