@@ -171,6 +171,7 @@ CREATE TABLE IF NOT EXISTS sales (
   customer_id TEXT REFERENCES customers(id),
   customer_name TEXT DEFAULT 'Walk-in',
   staff_name TEXT,
+  seller TEXT,                     -- username of who rang it up (sellers see only their own sales)
   payment_method TEXT NOT NULL DEFAULT 'cash',
   status TEXT NOT NULL DEFAULT 'completed',
   amount_paid REAL NOT NULL DEFAULT 0,

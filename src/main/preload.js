@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld('pos', {
   closeShift: (args) => ipcRenderer.invoke('pos:closeShift', args),
   listShifts: () => ipcRenderer.invoke('pos:listShifts'),
   getShiftReport: (id) => ipcRenderer.invoke('pos:getShiftReport', id),
+  dayReport: (args) => ipcRenderer.invoke('pos:dayReport', args),
   listSales: (params) => ipcRenderer.invoke('pos:listSales', params),
   getSale: (saleId) => ipcRenderer.invoke('pos:getSale', saleId),
   pendingSyncCount: () => ipcRenderer.invoke('pos:pendingSyncCount'),

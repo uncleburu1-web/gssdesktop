@@ -92,6 +92,12 @@ function migrate(db) {
   // Stage 3: shifts and cash movements are uploaded too. Existing ones keep synced_at NULL on
   // purpose, so a cloud that understands them (protocol 3) receives the till's shift history once.
   if (!hasColumn('shifts', 'synced_at')) db.exec('ALTER TABLE shifts ADD COLUMN synced_at TEXT');
+  if (!hasColumn('sales', 'seller')) {
+    // Who rang each sale up. Older sales made inside a shift get the shift's cashier; the rest stay
+    // unknown (only owners and roles allowed to see every sale see those).
+    db.exec('ALTER TABLE sales ADD COLUMN seller TEXT');
+    db.exec(`UPDATE sales SET seller = (SELECT owner FROM shifts WHERE shifts.id = sales.shift_id) WHERE seller IS NULL AND shift_id IS NOT NULL`);
+  }
   if (!hasColumn('cash_movements', 'synced_at')) db.exec('ALTER TABLE cash_movements ADD COLUMN synced_at TEXT');
   backfillPayments(db);
 }
@@ -499,6 +505,7 @@ function applyPulledSale(db, entityId, operation, payload) {
     db.prepare(
       `UPDATE sales SET customer_id=?, customer_name=?, staff_name=?, payment_method=?, status=?, amount_paid=?, invoice_number=?, updated_at=?, synced_at=? WHERE id=?`
     ).run(...fields, ts, ts, entityId);
+    if (payload.seller_username) db.prepare(`UPDATE sales SET seller = ? WHERE id = ? AND seller IS NULL`).run(payload.seller_username, entityId);
   } else {
     // receipt_no is only present once the cloud stores it (older clouds leave it out: NULL, which the
     // unique index ignores). A receipt number already used by ANOTHER local sale is dropped rather than
@@ -506,10 +513,10 @@ function applyPulledSale(db, entityId, operation, payload) {
     const receiptNo = payload.receipt_no && !db.prepare(`SELECT 1 FROM sales WHERE receipt_no = ?`).get(payload.receipt_no)
       ? payload.receipt_no : null;
     db.prepare(
-      `INSERT INTO sales (id, invoice_number, receipt_no, customer_id, customer_name, staff_name, payment_method, status, amount_paid, date, created_at, updated_at, is_deleted, synced_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
+      `INSERT INTO sales (id, invoice_number, receipt_no, customer_id, customer_name, staff_name, seller, payment_method, status, amount_paid, date, created_at, updated_at, is_deleted, synced_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
     ).run(entityId, payload.invoice_number ?? null, receiptNo, payload.customer_id || null, payload.customer_name || 'Walk-in',
-      payload.staff_name || '', payload.payment_method || 'cash', payload.status || 'completed', payload.amount_paid || 0,
+      payload.staff_name || '', payload.seller_username || null, payload.payment_method || 'cash', payload.status || 'completed', payload.amount_paid || 0,
       payload.date || ts, ts, ts, ts);
   }
   if (Array.isArray(payload.payments)) mergePulledPayments(db, entityId, payload.payments, payload.status);
@@ -689,9 +696,9 @@ const createSale = (db) => db.transaction((input) => {
   const shift = input.cart_owner ? getOpenShift(db, input.cart_owner) : null;
 
   db.prepare(
-    `INSERT INTO sales (id, invoice_number, receipt_no, shift_id, customer_id, customer_name, staff_name, payment_method, status, amount_paid, date, created_at, updated_at, is_deleted)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
-  ).run(saleId, invoiceNumber, receiptNo, shift ? shift.id : null, input.customer_id || null, input.customer_name || 'Walk-in', input.staff_name || '', input.payment_method || 'cash', status, 0, ts, ts, ts);
+    `INSERT INTO sales (id, invoice_number, receipt_no, shift_id, customer_id, customer_name, staff_name, seller, payment_method, status, amount_paid, date, created_at, updated_at, is_deleted)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+  ).run(saleId, invoiceNumber, receiptNo, shift ? shift.id : null, input.customer_id || null, input.customer_name || 'Walk-in', input.staff_name || '', input.cart_owner || null, input.payment_method || 'cash', status, 0, ts, ts, ts);
 
   for (const item of input.items) {
     const itemId = uuid();
@@ -816,10 +823,11 @@ const addPayment = (db) => db.transaction((saleId, amount, opts = {}) => {
  * Used to load EVERY sale ever made and run two queries per sale before filtering by status in
  * JavaScript, so the history screen got slower with every sale and froze the till after a while.
  */
-function listSales(db, { status = null, limit = null, offset = 0 } = {}) {
+function listSales(db, { status = null, limit = null, offset = 0, seller = null } = {}) {
   const where = ['is_deleted = 0'];
   const params = [];
   if (status) { where.push('status = ?'); params.push(status); }
+  if (seller !== null) { where.push('seller = ?'); params.push(seller); } // a seller's own sales only
   let sql = `SELECT * FROM sales WHERE ${where.join(' AND ')} ORDER BY date DESC, rowid DESC`;
   if (limit != null) {
     sql += ' LIMIT ? OFFSET ?';
@@ -983,6 +991,8 @@ function computeShiftReport(db, shift) {
     },
     voided: { count: voided.n, paid: money2(voided.paid) },
     outstanding: { count: owing.length, balance: money2(owing.reduce((sum, s) => sum + s.balance_due, 0)) },
+    // Every cash in/out of this drawer with its reason, so the cashier sees their money movement.
+    cash_movements: db.prepare(`SELECT created_at, kind, amount, reason FROM cash_movements WHERE shift_id = ? ORDER BY created_at`).all(shift.id),
     first_receipt: built.length ? built[0].receipt_no : null,
     last_receipt: built.length ? built[built.length - 1].receipt_no : null,
   };
@@ -1221,6 +1231,111 @@ function backfillSyncedAt(db) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Day report: everything that happened on this till on one calendar day (local time).
+//   seller = null      everyone (owners, managers, roles allowed to see every sale) — per-seller breakdown
+//   seller = 'ada'     only what ada did: her sales, payments she took, her cash in/out and shifts
+// Computed fresh from the local books each time; printed on the receipt printer.
+// ---------------------------------------------------------------------------------------------
+function dayBounds(date) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ''));
+  if (!m) throw new Error('Pick a day for the report.');
+  const start = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  const end = new Date(start); end.setDate(end.getDate() + 1);
+  return [start.toISOString(), end.toISOString()];
+}
+
+function getDayReport(db, { date, seller = null } = {}) {
+  const [from, to] = dayBounds(date);
+  const who = (s) => s.seller || s.staff_name || 'Unknown';
+
+  const saleRows = db.prepare(
+    `SELECT * FROM sales WHERE date >= ? AND date < ? AND is_deleted = 0 ${seller !== null ? 'AND seller = ?' : ''} ORDER BY date, rowid`
+  ).all(...(seller !== null ? [from, to, seller] : [from, to]));
+  const items = loadItemsBySale(db, saleRows.map((r) => r.id));
+  const sales = saleRows.map((r) => buildSale(r, items.get(r.id) || []));
+  const voided = db.prepare(
+    `SELECT COUNT(*) AS n, COALESCE(SUM(amount_paid), 0) AS paid FROM sales WHERE date >= ? AND date < ? AND is_deleted = 1 ${seller !== null ? 'AND seller = ?' : ''}`
+  ).get(...(seller !== null ? [from, to, seller] : [from, to]));
+
+  // Money received today, whenever the sale was made (an installment collected today counts today).
+  // Who took it: the cashier whose shift it was paid in, otherwise whoever made the sale.
+  const payments = db.prepare(
+    `SELECT p.method, p.amount, COALESCE(sh.owner, s.seller, s.staff_name, 'Unknown') AS taken_by
+       FROM sale_payments p JOIN sales s ON s.id = p.sale_id LEFT JOIN shifts sh ON sh.id = p.shift_id
+      WHERE p.paid_at >= ? AND p.paid_at < ? AND p.is_deleted = 0 AND s.is_deleted = 0`
+  ).all(from, to).filter((p) => seller === null || p.taken_by === seller);
+  const byMethod = { cash: 0, transfer: 0, pos: 0, other: 0 };
+  for (const p of payments) byMethod[p.method in byMethod ? p.method : 'other'] += p.amount;
+  for (const k of Object.keys(byMethod)) byMethod[k] = money2(byMethod[k]);
+
+  const cashMoves = db.prepare(
+    `SELECT c.created_at, c.kind, c.amount, c.reason, sh.owner FROM cash_movements c JOIN shifts sh ON sh.id = c.shift_id
+      WHERE c.created_at >= ? AND c.created_at < ? ${seller !== null ? 'AND sh.owner = ?' : ''} ORDER BY c.created_at`
+  ).all(...(seller !== null ? [from, to, seller] : [from, to]));
+
+  const shifts = db.prepare(
+    `SELECT owner, status, opened_at, closed_at, z_number, opening_float, expected_cash, counted_cash, variance FROM shifts
+      WHERE ((opened_at >= ? AND opened_at < ?) OR (closed_at >= ? AND closed_at < ?)) ${seller !== null ? 'AND owner = ?' : ''}
+      ORDER BY opened_at`
+  ).all(...(seller !== null ? [from, to, from, to, seller] : [from, to, from, to]));
+
+  const stockChanges = db.prepare(
+    `SELECT m.created_at, m.kind, SUM(m.quantity) AS quantity, m.reason, m.actor, p.name AS product_name
+       FROM stock_movements m LEFT JOIN products p ON p.id = m.product_id
+      WHERE m.created_at >= ? AND m.created_at < ? AND m.kind IN ('damage', 'adjustment') ${seller !== null ? 'AND m.actor = ?' : ''}
+      GROUP BY COALESCE(m.doc_id, m.id) ORDER BY m.created_at`
+  ).all(...(seller !== null ? [from, to, seller] : [from, to]));
+
+  const itemTotals = new Map();
+  for (const sale of sales) {
+    for (const it of sale.items) {
+      const row = itemTotals.get(it.item_name) || { name: it.item_name, quantity: 0, total: 0 };
+      row.quantity += Number(it.quantity) || 0;
+      row.total = money2(row.total + it.total);
+      itemTotals.set(it.item_name, row);
+    }
+  }
+
+  let bySeller = null;
+  if (seller === null) {
+    const map = new Map();
+    const entry = (name) => map.get(name) || map.set(name, { seller: name, sales: 0, total: 0, received: 0 }).get(name);
+    for (const sale of sales) { const e = entry(who(sale)); e.sales += 1; e.total = money2(e.total + sale.total); }
+    for (const p of payments) { const e = entry(p.taken_by); e.received = money2(e.received + p.amount); }
+    bySeller = [...map.values()].sort((a, b) => b.total - a.total);
+  }
+
+  const owing = sales.filter((x) => x.status === 'outstanding');
+  const paidIn = money2(cashMoves.filter((c) => c.kind === 'paid_in').reduce((t, c) => t + c.amount, 0));
+  const paidOut = money2(cashMoves.filter((c) => c.kind === 'paid_out').reduce((t, c) => t + c.amount, 0));
+  return {
+    date,
+    scope: seller === null ? 'everyone' : 'seller',
+    seller,
+    generated_at: nowIso(),
+    sales: {
+      count: sales.length,
+      gross: money2(sales.reduce((t, x) => t + x.total, 0)),
+      discounts: money2(sales.reduce((t, x) => t + x.items.reduce((d, i) => d + Number(i.discount || 0), 0), 0)),
+      items_sold: sales.reduce((t, x) => t + x.items.reduce((q, i) => q + (Number(i.quantity) || 0), 0), 0),
+      // Profit is owner information: only on the everyone report.
+      profit: seller === null ? money2(sales.reduce((t, x) => t + x.profit, 0)) : null,
+    },
+    outstanding: { count: owing.length, balance: money2(owing.reduce((t, x) => t + x.balance_due, 0)) },
+    voided: { count: voided.n, paid: money2(voided.paid) },
+    payments: { total: money2(Object.values(byMethod).reduce((t, v) => t + v, 0)), by_method: byMethod },
+    cash: { paid_in: paidIn, paid_out: paidOut, movements: cashMoves },
+    shifts,
+    stock_changes: stockChanges,
+    top_items: [...itemTotals.values()].sort((a, b) => b.quantity - a.quantity).slice(0, 10),
+    by_seller: bySeller,
+    sellers: seller === null
+      ? db.prepare(`SELECT DISTINCT seller FROM sales WHERE seller IS NOT NULL UNION SELECT DISTINCT owner FROM shifts ORDER BY 1`).all().map((r) => r.seller)
+      : [seller],
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
 // Stock ledger (stage 4): damage write-offs and stock counts.
 //   damage      any signed-in worker, reason required, never more than is in stock
 //   adjustment  owners only (checked in main.js AND by the cloud), reason required
@@ -1398,6 +1513,7 @@ module.exports = {
   getSale,
   applyPulledOperation,
   recordDamage,
+  getDayReport,
   recordStockCount,
   listStockMovements,
   getLastPullAt,

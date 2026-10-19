@@ -71,6 +71,16 @@ app.whenReady().then(() => {
     syncEngine.pushNow();
     return result;
   });
+  // Who may see every seller's sales, shifts and reports on this till: owners/managers/CEO, and any
+  // role the owner allowed 'view_all_sales' in the Control Center (kept in the profile for offline).
+  const seesEveryone = () => {
+    const p = auth.getUserProfile(database);
+    return Boolean(p.is_owner || (p.capabilities && p.capabilities.view_all_sales));
+  };
+  // Day report: everyone's day for those allowed; otherwise only the signed-in seller's own.
+  ipcMain.handle('pos:dayReport', (_e, { date, seller = null } = {}) =>
+    db.getDayReport(database, { date, seller: seesEveryone() ? (seller || null) : cartOwner() }));
+
   // Stock ledger (stage 4). Damage: anyone signed in, with a reason. A stock count: owners only;
   // the cloud checks the same thing again when the count is uploaded.
   ipcMain.handle('pos:recordDamage', (_e, input) => {
@@ -91,7 +101,7 @@ app.whenReady().then(() => {
   ipcMain.handle('pos:listStockMovements', (_e, params = {}) => {
     const profile = auth.getUserProfile(database);
     // Sellers see the movements they recorded; owners see everything.
-    return db.listStockMovements(database, { ...params, actor: profile.is_owner ? (params.actor || null) : (profile.username || '') });
+    return db.listStockMovements(database, { ...params, actor: seesEveryone() ? (params.actor || null) : (profile.username || '') });
   });
   // Unfinished carts belong to whoever is logged in on this till; the renderer never names the owner.
   const cartOwner = () => auth.getUserProfile(database).username || '';
@@ -110,10 +120,10 @@ app.whenReady().then(() => {
   });
   ipcMain.handle('pos:cashMovement', (_e, movement) => db.addCashMovement(database, cartOwner(), movement));
   ipcMain.handle('pos:closeShift', (_e, args) => db.closeShift(database, cartOwner(), args));
-  ipcMain.handle('pos:listShifts', () => db.listShifts(database, { owner: auth.getUserProfile(database).is_owner ? null : cartOwner() }));
+  ipcMain.handle('pos:listShifts', () => db.listShifts(database, { owner: seesEveryone() ? null : cartOwner() }));
   ipcMain.handle('pos:getShiftReport', (_e, shiftId) => {
     const report = db.getShiftReport(database, shiftId);
-    if (report && !auth.getUserProfile(database).is_owner && report.shift.owner !== cartOwner()) {
+    if (report && !seesEveryone() && report.shift.owner !== cartOwner()) {
       const err = new Error("You can only open your own shifts' reports.");
       err.code = 'forbidden';
       throw err;
@@ -122,7 +132,9 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle('pos:createSale', (_e, input) => {
-    const result = db.createSale(database)({ ...input, cart_owner: cartOwner() });
+    const me = auth.getUserProfile(database);
+    // Who rang it up is decided here, never by the screen: the signed-in user.
+    const result = db.createSale(database)({ ...input, cart_owner: cartOwner(), staff_name: me.full_name || me.username || '' });
     syncEngine.pushNow(); // the whole point of this line — a sale should reach the cloud immediately, not up to 15s later
     return result;
   });
@@ -136,8 +148,17 @@ app.whenReady().then(() => {
     syncEngine.pushNow();
     return result;
   });
-  ipcMain.handle('pos:listSales', (_e, params) => db.listSales(database, params));
-  ipcMain.handle('pos:getSale', (_e, saleId) => db.getSale(database, saleId));
+  // Sellers see only the sales they made; owners and roles allowed to see every sale see all.
+  ipcMain.handle('pos:listSales', (_e, params = {}) => db.listSales(database, { ...params, seller: seesEveryone() ? null : cartOwner() }));
+  ipcMain.handle('pos:getSale', (_e, saleId) => {
+    const sale = db.getSale(database, saleId);
+    if (sale && !seesEveryone() && sale.seller !== cartOwner()) {
+      const err = new Error('You can only open your own sales.');
+      err.code = 'forbidden';
+      throw err;
+    }
+    return sale;
+  });
   ipcMain.handle('pos:pendingSyncCount', () =>
     database.prepare(`SELECT COUNT(*) AS n FROM sync_queue WHERE status = 'pending'`).get().n
   );

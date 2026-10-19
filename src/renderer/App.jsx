@@ -7,6 +7,7 @@ import CustomersScreen from './CustomersScreen.jsx';
 import SalesHistoryScreen from './SalesHistoryScreen.jsx';
 import PrinterSettingsScreen from './PrinterSettingsScreen.jsx';
 import ShiftScreen from './ShiftScreen.jsx';
+import DayReportScreen from './DayReport.jsx';
 import { Icons } from './Icons.jsx';
 import { fmtRelative } from './format.js';
 
@@ -106,6 +107,8 @@ function Shell() {
   // page exactly. Customers has no web equivalent restriction at all, so
   // it's open to every role.
   const isOwner = Boolean(profile?.is_owner);
+  // Sees every seller's sales and day report: owners/managers/CEO and roles the owner allowed.
+  const seesEveryone = isOwner || Boolean(profile?.capabilities?.view_all_sales);
 
   function handleLogout() {
     window.pos.logout().then(() => {
@@ -123,6 +126,7 @@ function Shell() {
         <NavButton active={view === 'customers'} onClick={() => setView('customers')}>Customers</NavButton>
         <NavButton active={view === 'history'} onClick={() => setView('history')}>Sales history</NavButton>
         <NavButton active={view === 'shift'} onClick={() => setView('shift')}>Shift</NavButton>
+        <NavButton active={view === 'dayreport'} onClick={() => setView('dayreport')}>Day report</NavButton>
         <NavButton active={view === 'printer'} onClick={() => setView('printer')}>Printer</NavButton>
         <div style={{ flex: 1 }} />
         <div style={{ fontSize: 11.5, color: 'var(--text-dim)', padding: '0 6px', marginBottom: 4 }}>
@@ -178,6 +182,7 @@ function Shell() {
         {view === 'customers' && <CustomersScreen refreshKey={saleTick} />}
         {view === 'history' && <SalesHistoryScreen refreshKey={saleTick} />}
         {view === 'shift' && <ShiftScreen refreshKey={saleTick} profile={profile} />}
+        {view === 'dayreport' && <DayReportScreen profile={profile} seesEveryone={seesEveryone} />}
         {view === 'printer' && <PrinterSettingsScreen profile={profile} />}
       </div>
     </div>

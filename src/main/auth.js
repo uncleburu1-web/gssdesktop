@@ -269,6 +269,8 @@ async function login(db, username, password) {
         is_owner: me.is_owner,
         is_ceo: Boolean(me.is_ceo),
         role: me.role,
+        // Kept so the till can decide offline what this person may see (e.g. view_all_sales).
+        capabilities: me.capabilities || {},
       };
       storeUserProfile(db, profile);
       storeOfflineProfile(db, username, profile); // so THIS user's own role/name is what offline login restores later, not whoever logged in last
