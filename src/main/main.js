@@ -206,7 +206,13 @@ app.whenReady().then(() => {
   // anything the cashier is doing at the till.
   // appVersion: the heartbeat used to fall back to a hard-coded '0.1.0', so every till reported
   // the same version to the dashboard no matter what was actually installed.
-  startHeartbeat(database, { deviceName: os.hostname(), appVersion: app.getVersion() });
+  startHeartbeat(database, {
+    deviceName: os.hostname(),
+    appVersion: app.getVersion(),
+    // Stage 1b: while the live socket is up its pongs are the heartbeat; HTTP only fills the gaps.
+    isLiveConnected: () => syncEngine.getStatus().liveConnected,
+    queueStats: () => db.getSyncQueueStats(database),
+  });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
