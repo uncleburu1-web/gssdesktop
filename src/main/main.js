@@ -71,6 +71,28 @@ app.whenReady().then(() => {
     syncEngine.pushNow();
     return result;
   });
+  // Stock ledger (stage 4). Damage: anyone signed in, with a reason. A stock count: owners only;
+  // the cloud checks the same thing again when the count is uploaded.
+  ipcMain.handle('pos:recordDamage', (_e, input) => {
+    const result = db.recordDamage(database, input);
+    syncEngine.pushNow();
+    return result;
+  });
+  ipcMain.handle('pos:recordStockCount', (_e, input) => {
+    if (!auth.getUserProfile(database).is_owner) {
+      const err = new Error('Only an owner can adjust stock after a count.');
+      err.code = 'forbidden';
+      throw err;
+    }
+    const result = db.recordStockCount(database, input);
+    syncEngine.pushNow();
+    return result;
+  });
+  ipcMain.handle('pos:listStockMovements', (_e, params = {}) => {
+    const profile = auth.getUserProfile(database);
+    // Sellers see the movements they recorded; owners see everything.
+    return db.listStockMovements(database, { ...params, actor: profile.is_owner ? (params.actor || null) : (profile.username || '') });
+  });
   // Unfinished carts belong to whoever is logged in on this till; the renderer never names the owner.
   const cartOwner = () => auth.getUserProfile(database).username || '';
   ipcMain.handle('pos:saveDraft', (_e, cart) => db.saveDraft(database, cartOwner(), cart));

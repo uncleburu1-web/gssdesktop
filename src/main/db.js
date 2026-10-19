@@ -602,6 +602,7 @@ const PULL_HANDLERS = {
   customer: applyPulledCustomer,
   sale: applyPulledSale,
   sale_item: applyPulledSaleItem,
+  stock_movement: applyPulledStockMovement,
 };
 
 function applyPulledOperation(db, entityType, operation, payload) {
@@ -1172,6 +1173,10 @@ function reconcileUnsyncedRows(db) {
       { table: 'cash_movements', entityType: 'cash_movement', covered: `q.entity_type = 'cash_movement' AND q.entity_id = t.id`, noSoftDelete: true },
     );
   }
+  if (cloudSyncProtocol(db) >= 4) {
+    // Damage and stock counts recorded before the cloud could take them (stage 4).
+    tables.push({ table: 'stock_docs', entityType: 'stock_movement', covered: `q.entity_type = 'stock_movement' AND q.entity_id = t.id`, noSoftDelete: true });
+  }
   let queued = 0;
   for (const { table, entityType, covered, noSoftDelete } of tables) {
     const orphans = db.prepare(
@@ -1215,10 +1220,152 @@ function backfillSyncedAt(db) {
   })();
 }
 
+// ---------------------------------------------------------------------------------------------
+// Stock ledger (stage 4): damage write-offs and stock counts.
+//   damage      any signed-in worker, reason required, never more than is in stock
+//   adjustment  owners only (checked in main.js AND by the cloud), reason required
+// The till applies the change to its own batches immediately (it must work offline) and queues
+// ONE 'stock_movement' document for the cloud, which applies the same rule to its own stock.
+// ---------------------------------------------------------------------------------------------
+function wholeQuantity(value, label) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) throw new Error(`${label} must be a number.`);
+  if (!Number.isInteger(n)) throw new Error(`${label} must be a whole number for this product.`);
+  return n;
+}
+
+function liveBatchesFefo(db, productId) {
+  return db.prepare(
+    `SELECT * FROM stock_batches WHERE product_id = ? AND is_deleted = 0
+     ORDER BY (expiry_date IS NULL), expiry_date, received_date`
+  ).all(productId);
+}
+
+function insertLocalMovement(db, { docId, productId, batchId, kind, quantity, reason, actor, at }) {
+  db.prepare(
+    `INSERT INTO stock_movements (id, doc_id, product_id, batch_id, kind, quantity, reason, actor, origin, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'local', ?)`
+  ).run(uuid(), docId, productId, batchId, kind, quantity, reason, actor, at);
+}
+
+function takeFefo(db, productId, quantity, meta) {
+  let remaining = quantity;
+  for (const batch of liveBatchesFefo(db, productId)) {
+    if (remaining <= 0) break;
+    if (batch.quantity_remaining <= 0) continue;
+    const take = Math.min(batch.quantity_remaining, remaining);
+    db.prepare(`UPDATE stock_batches SET quantity_remaining = quantity_remaining - ?, updated_at = ? WHERE id = ?`).run(take, meta.at, batch.id);
+    insertLocalMovement(db, { ...meta, productId, batchId: batch.id, quantity: -take });
+    remaining -= take;
+  }
+}
+
+function enqueueStockDoc(db, doc) {
+  if (cloudSyncProtocol(db) >= 4) enqueueSync(db, { entityType: 'stock_movement', entityId: doc.id, operation: 'create', payload: doc });
+}
+
+function recordDamage(db, { product_id, quantity, reason } = {}) {
+  const why = String(reason || '').trim();
+  if (!why) throw new Error('Say why the stock is damaged — a reason is required.');
+  const qty = wholeQuantity(quantity, 'Quantity');
+  if (qty <= 0) throw new Error('Quantity must be more than zero.');
+  return db.transaction(() => {
+    const product = db.prepare(`SELECT id, name FROM products WHERE id = ? AND is_deleted = 0`).get(product_id);
+    if (!product) throw new Error('Product not found.');
+    const available = liveBatchesFefo(db, product_id).reduce((s, b) => s + b.quantity_remaining, 0);
+    if (qty > available) throw new Error(`Only ${available} of ${product.name} in stock — cannot write off ${qty}.`);
+    const doc = { id: uuid(), kind: 'damage', product_id, quantity: qty, system_quantity: null, counted_quantity: null,
+      reason: why, actor: currentActor(db), created_at: nowIso() };
+    db.prepare(
+      `INSERT INTO stock_docs (id, kind, product_id, quantity, reason, actor, created_at) VALUES (?, 'damage', ?, ?, ?, ?, ?)`
+    ).run(doc.id, product_id, qty, why, doc.actor, doc.created_at);
+    takeFefo(db, product_id, qty, { docId: doc.id, kind: 'damage', reason: why, actor: doc.actor, at: doc.created_at });
+    enqueueStockDoc(db, doc);
+    return { ...doc, product: getProduct(db, product_id) };
+  })();
+}
+
+function recordStockCount(db, { product_id, counted_quantity, reason } = {}) {
+  const why = String(reason || '').trim();
+  if (!why) throw new Error('Say why the count differs — a reason is required.');
+  const counted = wholeQuantity(counted_quantity, 'Counted quantity');
+  if (counted < 0) throw new Error('Counted quantity cannot be negative.');
+  return db.transaction(() => {
+    const product = db.prepare(`SELECT id FROM products WHERE id = ? AND is_deleted = 0`).get(product_id);
+    if (!product) throw new Error('Product not found.');
+    const batches = liveBatchesFefo(db, product_id);
+    const system = batches.reduce((s, b) => s + b.quantity_remaining, 0);
+    const diff = counted - system;
+    if (diff === 0) return { unchanged: true, product: getProduct(db, product_id) };
+    const at = nowIso();
+    const doc = { id: uuid(), kind: 'adjustment', product_id, quantity: null, system_quantity: system, counted_quantity: counted,
+      reason: why, actor: currentActor(db), created_at: at };
+    db.prepare(
+      `INSERT INTO stock_docs (id, kind, product_id, system_quantity, counted_quantity, reason, actor, created_at)
+       VALUES (?, 'adjustment', ?, ?, ?, ?, ?, ?)`
+    ).run(doc.id, product_id, system, counted, why, doc.actor, at);
+    const meta = { docId: doc.id, kind: 'adjustment', reason: why, actor: doc.actor, at };
+    if (diff < 0) {
+      takeFefo(db, product_id, -diff, meta);
+    } else {
+      // Surplus goes on the newest batch, as on the cloud. With no batch at all, a local one is
+      // created; it is NOT uploaded as a batch (the cloud makes its own when it applies the count).
+      let target = batches.slice().sort((a, b) => String(b.received_date).localeCompare(String(a.received_date)))[0];
+      if (!target) {
+        const id = uuid();
+        db.prepare(
+          `INSERT INTO stock_batches (id, product_id, batch_number, quantity_received, quantity_remaining, cost_price, expiry_date, received_date, created_at, updated_at, is_deleted, synced_at)
+           VALUES (?, ?, 'COUNT', 0, 0, 0, NULL, ?, ?, ?, 0, ?)`
+        ).run(id, product_id, at, at, at, at);
+        target = { id };
+      }
+      db.prepare(`UPDATE stock_batches SET quantity_remaining = quantity_remaining + ?, updated_at = ? WHERE id = ?`).run(diff, at, target.id);
+      insertLocalMovement(db, { ...meta, productId: product_id, batchId: target.id, quantity: diff });
+    }
+    enqueueStockDoc(db, doc);
+    return { ...doc, product: getProduct(db, product_id) };
+  })();
+}
+
+function listStockMovements(db, { productId = null, actor = null, from = null, to = null, limit = 500 } = {}) {
+  const where = [];
+  const args = [];
+  if (productId) { where.push('m.product_id = ?'); args.push(productId); }
+  if (actor) { where.push('m.actor = ?'); args.push(actor); }
+  if (from) { where.push('m.created_at >= ?'); args.push(from); }
+  if (to) { where.push('m.created_at < ?'); args.push(to); }
+  return db.prepare(
+    `SELECT m.*, p.name AS product_name FROM stock_movements m LEFT JOIN products p ON p.id = m.product_id
+     ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY m.created_at DESC LIMIT ?`
+  ).all(...args, limit);
+}
+
+/**
+ * A movement the cloud recorded (damage/count/service part done on the web, Android or another
+ * till). Applied to this till's batch exactly once: skipped if already here, or if it is the
+ * cloud's copy of a document THIS till recorded (client_ref = our stock_docs id).
+ */
+function applyPulledStockMovement(db, entityId, operation, payload) {
+  if (operation === 'delete') return;
+  if (db.prepare(`SELECT 1 FROM stock_movements WHERE id = ?`).get(entityId)) return;
+  if (payload.client_ref && db.prepare(`SELECT 1 FROM stock_docs WHERE id = ?`).get(payload.client_ref)) return;
+  const quantity = Number(payload.quantity) || 0;
+  const batch = payload.batch_id ? db.prepare(`SELECT id, quantity_remaining FROM stock_batches WHERE id = ?`).get(payload.batch_id) : null;
+  if (batch && quantity !== 0) {
+    const next = Math.max(0, batch.quantity_remaining + quantity);
+    db.prepare(`UPDATE stock_batches SET quantity_remaining = ?, updated_at = ? WHERE id = ?`).run(next, nowIso(), batch.id);
+  }
+  db.prepare(
+    `INSERT INTO stock_movements (id, doc_id, product_id, batch_id, kind, quantity, reason, actor, origin, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'cloud', ?)`
+  ).run(entityId, payload.client_ref || null, payload.product_id, payload.batch_id || null, payload.kind, quantity,
+    payload.reason || '', payload.actor_name || null, payload.created_at || nowIso());
+}
+
 // Which local rows an acknowledged outbox row stands for (sale_payment rows have no synced_at column).
 const ACK_TABLES = {
   product: 'products', stock_batch: 'stock_batches', customer: 'customers', sale: 'sales', sale_item: 'sale_items',
-  shift: 'shifts', cash_movement: 'cash_movements',
+  shift: 'shifts', cash_movement: 'cash_movements', stock_movement: 'stock_docs',
 };
 
 /** The cloud confirmed this outbox row: stamp synced_at on the local row(s) it carried. */
@@ -1250,6 +1397,9 @@ module.exports = {
   listSales,
   getSale,
   applyPulledOperation,
+  recordDamage,
+  recordStockCount,
+  listStockMovements,
   getLastPullAt,
   setLastPullAt,
   getSetting,

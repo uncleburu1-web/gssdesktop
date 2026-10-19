@@ -45,6 +45,7 @@ const snapshot = (db) => ({
   invoices: one(db, `SELECT COALESCE(MAX(invoice_number), 0) AS n FROM sales`),
   shifts: countIfTable(db, 'shifts'),
   cashMovements: countIfTable(db, 'cash_movements'),
+  stockDocs: countIfTable(db, 'stock_docs'),
 });
 
 // Fingerprint of every queued change: id + what it says. The upgrade must not alter a single one.

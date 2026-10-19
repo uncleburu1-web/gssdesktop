@@ -311,11 +311,12 @@ function startSyncEngine(db, onDataChanged) {
   }
 
   /** One page of a pull. Resolves to the parsed body, or null when this run must stop (state set). */
-  async function fetchPullPage(since, cursor) {
+  async function fetchPullPage(since, cursor, entityTypes = null) {
     let token = getAccessToken(db);
     if (!token) return null; // not logged in yet
     const params = new URLSearchParams();
     if (since) params.set('since', since);
+    if (entityTypes) params.set('entity_types', entityTypes);
     params.set('limit', String(PULL_PAGE_SIZE));
     if (cursor) params.set('cursor', cursor);
     const url = `${API_BASE}/sync/pull/?${params.toString()}`;
@@ -418,6 +419,7 @@ function startSyncEngine(db, onDataChanged) {
       // them now, instead of waiting for the next restart's reconcile.
       if (reconcileUnsyncedRows(db) > 0) setImmediate(() => pushNow());
     }
+    if (protocol >= 4 && !getSetting(db, 'stock_movements_backfilled')) await backfillStockMovements();
     // Cursor from the SERVER's clock, not this machine's. next_since (from the FIRST page, the
     // earliest read) is already moved back behind the read, so a row committed while this pull was
     // reading comes back next time instead of being skipped forever (G4). Older clouds: server_time.
@@ -429,6 +431,34 @@ function startSyncEngine(db, onDataChanged) {
       if (Date.parse(updatedAt) <= Date.parse(nextCursor)) appliedInOverlap.delete(key); // cannot come back: the next pull starts after it
     }
     pullFailureCount = 0;
+  }
+
+  /**
+   * Once, the first time this till talks to a cloud with the stock ledger (protocol 4): fetch every
+   * damage/count/service-part movement from the beginning. The ordinary pull's cursor may already be
+   * past movements recorded while this till was still on an older version that ignored them.
+   * Each one is applied at most once (db.applyPulledStockMovement), so a repeat is harmless.
+   */
+  async function backfillStockMovements() {
+    let cursor = null;
+    let pages = 0;
+    const changed = [];
+    do {
+      const body = await fetchPullPage(null, cursor, 'stock_movement');
+      if (!body) return; // try again on the next pull
+      const skipped = [];
+      const operations = body.operations || [];
+      for (let i = 0; i < operations.length; i += PULL_APPLY_CHUNK) {
+        applyChunk(operations.slice(i, i + PULL_APPLY_CHUNK), skipped);
+        await tick();
+      }
+      changed.push(...operations);
+      pages += 1;
+      cursor = body.has_more && body.next_cursor ? body.next_cursor : null;
+    } while (cursor && pages < MAX_PULL_PAGES);
+    if (cursor) return;
+    setSetting(db, 'stock_movements_backfilled', new Date().toISOString());
+    if (changed.length > 0) onDataChanged?.(changed);
   }
 
   /** The single-flight pull. A pull requested during a push waits for it (push first, then pull). */
