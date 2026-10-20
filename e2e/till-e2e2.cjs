@@ -6,8 +6,9 @@
  */
 // Stages 7-10 with two real tills (new code) against the real Django server on :8000 + Postgres.
 const D = require('path').resolve(__dirname, '..');
-require(D + '/test/_setup');
-process.env.BENCHLINE_API_URL = process.env.BENCHLINE_API_URL || 'http://127.0.0.1:8000/api';
+const SERVER = process.env.E2E_API_URL || 'http://127.0.0.1:8000/api';
+require(D + '/test/_setup'); // sets a fake cloud URL for unit tests, so point back at the real server after it
+process.env.BENCHLINE_API_URL = SERVER;
 const os = require('os'); const fs = require('fs'); const path = require('path');
 const { execSync } = require('child_process');
 const dbm = require(D + '/src/main/db'); const auth = require(D + '/src/main/auth'); const sync = require(D + '/src/main/sync');

@@ -98,7 +98,7 @@ export default function Receipt({ sale, cashReceived, change, shop }) {
             <span>{money(item.total)}</span>
           </div>
           <div className="receipt-row receipt-item-sub">
-            <span>{item.quantity} Units x {money(item.unit_price)} / Units</span>
+            <span>{item.by_weight ? `${Number(item.quantity).toFixed(3)} kg x ${money(item.unit_price)} / kg` : `${item.quantity} Units x ${money(item.unit_price)} / Units`}</span>
           </div>
         </div>
       ))}

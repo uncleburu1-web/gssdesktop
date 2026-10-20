@@ -19,7 +19,9 @@ export default function ProductsScreen({ refreshKey, isOwner, profile }) {
   // shop no longer gets offered "Laptop" here, and a pharmacy shop gets
   // its own Medicine/Tablet/... options instead of gadgets categories.
   const categories = categoriesForBusinessType(profile?.business_type);
-  const [form, setForm] = useState({ name: '', category: 'other', sell_price: '', min_stock: 2, barcode: '' });
+  const [form, setForm] = useState({ name: '', category: 'other', sell_price: '', min_stock: 2, barcode: '', sold_by_weight: false });
+  const qtyText = (p, q) => (p && p.sold_by_weight ? `${Number(q).toFixed(3)} kg` : q);
+  const qtyStep = (p) => (p && p.sold_by_weight ? '0.001' : '1');
   const [batchForm, setBatchForm] = useState({ quantity_received: '', cost_price: '', batch_number: '' });
   const [submitting, setSubmitting] = useState(false);
 
@@ -39,8 +41,9 @@ export default function ProductsScreen({ refreshKey, isOwner, profile }) {
       await window.pos.createProduct({
         name: form.name, category: form.category, barcode: form.barcode,
         sell_price: Number(form.sell_price || 0), min_stock: Number(form.min_stock || 0),
+        sold_by_weight: form.sold_by_weight,
       });
-      setForm({ name: '', category: 'other', sell_price: '', min_stock: 2, barcode: '' });
+      setForm({ name: '', category: 'other', sell_price: '', min_stock: 2, barcode: '', sold_by_weight: false });
       setAddOpen(false);
       load();
     } catch (err) {
@@ -146,9 +149,9 @@ export default function ProductsScreen({ refreshKey, isOwner, profile }) {
                     <td>{p.name}</td>
                     <td className="num">{p.barcode || '—'}</td>
                     <td>{CATEGORY_LABELS[p.category] || p.category}</td>
-                    <td className="num" style={{ color: p.quantity <= p.min_stock ? 'var(--warn)' : undefined }}>{p.quantity}</td>
+                    <td className="num" style={{ color: p.quantity <= p.min_stock ? 'var(--warn)' : undefined }}>{qtyText(p, p.quantity)}</td>
                     <td className="num">{money(p.cost_price)}</td>
-                    <td className="num">{money(p.sell_price)}</td>
+                    <td className="num">{money(p.sell_price)}{p.sold_by_weight ? ' /kg' : ''}</td>
                     <td style={{ whiteSpace: 'nowrap' }}>
                       {isOwner && <button className="btn ghost small" onClick={() => setStockOpen(p)}>+ Stock</button>}
                       <button className="btn ghost small" onClick={() => openChange(setDamageOpen, p)} disabled={!p.quantity}>Damage</button>
@@ -188,8 +191,12 @@ export default function ProductsScreen({ refreshKey, isOwner, profile }) {
                   <input type="number" min="0" value={form.min_stock} onChange={(e) => setForm({ ...form, min_stock: e.target.value })} />
                 </div>
               </div>
+              <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, marginBottom: 10 }}>
+                <input type="checkbox" checked={form.sold_by_weight} onChange={(e) => setForm({ ...form, sold_by_weight: e.target.checked })} />
+                Sold by weight (kg) — the price below is per kg and the cashier enters the weight
+              </label>
               <div className="field">
-                <label>Sell price (₦)</label>
+                <label>Sell price (₦{form.sold_by_weight ? ' per kg' : ''})</label>
                 <input required type="number" min="0" value={form.sell_price} onChange={(e) => setForm({ ...form, sell_price: e.target.value })} />
               </div>
               <div className="modal-actions">
@@ -208,11 +215,11 @@ export default function ProductsScreen({ refreshKey, isOwner, profile }) {
             <form onSubmit={handleAddStock}>
               <div className="field-row">
                 <div className="field">
-                  <label>Quantity received</label>
-                  <input required autoFocus type="number" min="1" value={batchForm.quantity_received} onChange={(e) => setBatchForm({ ...batchForm, quantity_received: e.target.value })} />
+                  <label>Quantity received{stockOpen.sold_by_weight ? ' (kg)' : ''}</label>
+                  <input required autoFocus type="number" min={qtyStep(stockOpen)} step={qtyStep(stockOpen)} value={batchForm.quantity_received} onChange={(e) => setBatchForm({ ...batchForm, quantity_received: e.target.value })} />
                 </div>
                 <div className="field">
-                  <label>Cost price (₦ per unit)</label>
+                  <label>Cost price (₦ per {stockOpen.sold_by_weight ? 'kg' : 'unit'})</label>
                   <input required type="number" min="0" value={batchForm.cost_price} onChange={(e) => setBatchForm({ ...batchForm, cost_price: e.target.value })} />
                 </div>
               </div>
@@ -233,11 +240,11 @@ export default function ProductsScreen({ refreshKey, isOwner, profile }) {
         <div className="modal-backdrop" onClick={() => setDamageOpen(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <h3>Record damage — {damageOpen.name}</h3>
-            <p className="page-sub" style={{ marginTop: 0 }}>In stock: {damageOpen.quantity}. Damaged, expired or missing stock comes off now; the owner sees who recorded it and why.</p>
+            <p className="page-sub" style={{ marginTop: 0 }}>In stock: {qtyText(damageOpen, damageOpen.quantity)}. Damaged, expired or missing stock comes off now; the owner sees who recorded it and why.</p>
             <form onSubmit={handleDamage}>
               <div className="field">
-                <label>Quantity damaged</label>
-                <input required autoFocus type="number" min="1" step="1" max={damageOpen.quantity} value={changeForm.quantity} onChange={(e) => setChangeForm({ ...changeForm, quantity: e.target.value })} />
+                <label>Quantity damaged{damageOpen.sold_by_weight ? ' (kg)' : ''}</label>
+                <input required autoFocus type="number" min={qtyStep(damageOpen)} step={qtyStep(damageOpen)} max={damageOpen.quantity} value={changeForm.quantity} onChange={(e) => setChangeForm({ ...changeForm, quantity: e.target.value })} />
               </div>
               <div className="field">
                 <label>Reason (required)</label>
@@ -256,11 +263,11 @@ export default function ProductsScreen({ refreshKey, isOwner, profile }) {
         <div className="modal-backdrop" onClick={() => setCountOpen(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <h3>Stock count — {countOpen.name}</h3>
-            <p className="page-sub" style={{ marginTop: 0 }}>The till says {countOpen.quantity}. Enter what is physically on the shelf; the difference is recorded with your name and reason.</p>
+            <p className="page-sub" style={{ marginTop: 0 }}>The till says {qtyText(countOpen, countOpen.quantity)}. Enter what is physically on the shelf; the difference is recorded with your name and reason.</p>
             <form onSubmit={handleCount}>
               <div className="field">
-                <label>Counted quantity</label>
-                <input required autoFocus type="number" min="0" step="1" value={changeForm.quantity} onChange={(e) => setChangeForm({ ...changeForm, quantity: e.target.value })} />
+                <label>Counted quantity{countOpen.sold_by_weight ? ' (kg)' : ''}</label>
+                <input required autoFocus type="number" min="0" step={qtyStep(countOpen)} value={changeForm.quantity} onChange={(e) => setChangeForm({ ...changeForm, quantity: e.target.value })} />
               </div>
               <div className="field">
                 <label>Reason (required)</label>

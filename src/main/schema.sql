@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS products (
   unit TEXT DEFAULT 'PIECE',
   sell_price REAL NOT NULL DEFAULT 0,
   min_stock INTEGER NOT NULL DEFAULT 2,
+  sold_by_weight INTEGER NOT NULL DEFAULT 0,  -- 1 = priced per kg, quantities in kg to the gram (stage 11)
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   is_deleted INTEGER NOT NULL DEFAULT 0,
