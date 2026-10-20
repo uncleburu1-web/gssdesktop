@@ -81,6 +81,19 @@ app.whenReady().then(() => {
   ipcMain.handle('pos:dayReport', (_e, { date, seller = null } = {}) =>
     db.getDayReport(database, { date, seller: seesEveryone() ? (seller || null) : cartOwner() }));
 
+  // Customer returns (stage 8): owners, and roles the owner allowed 'process_return'.
+  ipcMain.handle('pos:createReturn', (_e, input) => {
+    const p = auth.getUserProfile(database);
+    if (!(p.is_owner || (p.capabilities && p.capabilities.process_return))) {
+      const err = new Error("Your role can't take returns — ask an owner or manager.");
+      err.code = 'forbidden';
+      throw err;
+    }
+    const result = db.createReturn(database, input, cartOwner());
+    syncEngine.pushNow();
+    return result;
+  });
+
   // Stock ledger (stage 4). Damage: anyone signed in, with a reason. A stock count: owners only;
   // the cloud checks the same thing again when the count is uploaded.
   ipcMain.handle('pos:recordDamage', (_e, input) => {
@@ -164,8 +177,11 @@ app.whenReady().then(() => {
   );
   ipcMain.handle('pos:syncStatus', () => syncEngine.getStatus());
   // Puts every change the cloud rejected (or that gave up) back in line and tries again now.
+  ipcMain.handle('pos:paymentMethods', () => db.paymentMethods(database));
+  ipcMain.handle('pos:promotions', () => db.listPromotions(database));
   ipcMain.handle('pos:retryFailedSync', () => {
     const retried = db.retryFailedSync(database);
+    if (retried > 0) db.recordAuditEvent(database, 'sync.retry', { summary: `Retried ${retried} change(s) that had failed to sync`, data: { retried } });
     syncEngine.pushNow();
     return retried;
   });
