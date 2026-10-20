@@ -6,6 +6,7 @@ import SplitPaymentModal from './SplitPaymentModal.jsx';
 import Receipt from './Receipt.jsx';
 import CustomerPicker from './CustomerPicker.jsx';
 import { CATEGORY_LABELS } from './categories.js';
+import { bestDiscounts } from './promotions.js';
 
 function newLine(product) {
   return {
@@ -21,12 +22,14 @@ function newLine(product) {
 }
 
 export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
+  const [promotions, setPromotions] = useState([]);
   const paymentMethods = usePaymentMethods();
   const [catalog, setCatalog] = useState([]);
   const [loadingCatalog, setLoadingCatalog] = useState(true);
   const [search, setSearch] = useState('');
   const [category, setCategory] = useState('all');
   const [cart, setCart] = useState([]);
+  useEffect(() => { window.pos.promotions?.().then((p) => setPromotions(Array.isArray(p) ? p : [])).catch(() => {}); }, [refreshKey]);
   const [customerName, setCustomerName] = useState('');
   const [customer, setCustomer] = useState(null);
   const [paymentMethod, setPaymentMethod] = useState('cash');
@@ -118,7 +121,13 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
     });
   }, [catalog, category, search]);
 
-  const subtotal = cart.reduce((sum, l) => sum + l.quantity * Number(l.unit_price || 0), 0);
+  const grossTotal = cart.reduce((sum, l) => sum + l.quantity * Number(l.unit_price || 0), 0);
+  // Promotions the owner set up, applied the same way the cloud would (renderer/promotions.js).
+  const promoById = useMemo(() => new Map(promotions.map((p) => [String(p.id), p])), [promotions]);
+  const lineDiscounts = useMemo(() => bestDiscounts(cart, promotions, new Date()), [cart, promotions]);
+  const discountTotal = Math.round(lineDiscounts.reduce((t, d) => t + d.discount, 0) * 100) / 100;
+  // What the customer pays. Named `subtotal` because every payment control below already uses it.
+  const subtotal = Math.round((grossTotal - discountTotal) * 100) / 100;
   const cartCount = cart.reduce((n, l) => n + l.quantity, 0);
   const isSplit = splitPayments !== null;
   const isCashDue = paymentMethod === 'cash' && !installment && !isSplit;
@@ -213,7 +222,9 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
         status: installment ? 'outstanding' : 'completed',
         amount_paid: installment ? Number(amountPaid || 0) : undefined,
         ...(isSplit ? { payments: splitPayments } : {}),
-        items: cart.map((l) => ({
+        items: cart.map((l, idx) => ({
+          discount: lineDiscounts[idx].discount,
+          promotion_id: lineDiscounts[idx].promotion_id,
           product_id: l.product_id,
           item_name: l.item_name,
           category: l.category,
@@ -338,7 +349,7 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
         <div className="cart-items">
           {cart.length === 0 ? (
             <div className="cart-empty">Tap a product to add it to the cart.</div>
-          ) : cart.map((l) => (
+          ) : cart.map((l, idx) => (
             <div className="cart-line" key={l.key}>
               <div className="cart-line-info">
                 <div className="cart-line-name" title={l.item_name}>{l.item_name}</div>
@@ -351,7 +362,14 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
                 <span>{l.quantity}</span>
                 <button type="button" onClick={() => updateQty(l.key, 1)}>{Icons.plus}</button>
               </div>
-              <div className="cart-line-total num">{money(l.quantity * l.unit_price)}</div>
+              <div className="cart-line-total num">
+                {money(l.quantity * l.unit_price - (lineDiscounts[idx]?.discount || 0))}
+                {lineDiscounts[idx]?.discount > 0 && (
+                  <div style={{ fontSize: 11, color: 'var(--good)', fontWeight: 500 }} title={promoById.get(lineDiscounts[idx].promotion_id)?.name}>
+                    {promoById.get(lineDiscounts[idx].promotion_id)?.name || 'Promotion'} −{money(lineDiscounts[idx].discount)}
+                  </div>
+                )}
+              </div>
               <button className="cart-line-remove" onClick={() => removeLine(l.key)} aria-label="Remove">{Icons.x}</button>
             </div>
           ))}
@@ -390,6 +408,11 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
             <div className="field" style={{ marginBottom: 4 }}>
               <label>Amount paid now (₦)</label>
               <input type="number" min="0" max={subtotal} value={amountPaid} onChange={(e) => setAmountPaid(e.target.value)} placeholder="0" />
+            </div>
+          )}
+          {discountTotal > 0 && (
+            <div className="cart-totals-row" style={{ color: 'var(--good)' }}>
+              <span>Promotions</span><span className="num">−{money(discountTotal)}</span>
             </div>
           )}
           <div className="cart-totals-row grand">

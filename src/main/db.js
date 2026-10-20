@@ -92,6 +92,7 @@ function migrate(db) {
   // Stage 3: shifts and cash movements are uploaded too. Existing ones keep synced_at NULL on
   // purpose, so a cloud that understands them (protocol 3) receives the till's shift history once.
   if (!hasColumn('shifts', 'synced_at')) db.exec('ALTER TABLE shifts ADD COLUMN synced_at TEXT');
+  if (!hasColumn('sale_items', 'promotion_id')) db.exec('ALTER TABLE sale_items ADD COLUMN promotion_id TEXT');
   if (!hasColumn('sales', 'seller')) {
     // Who rang each sale up. Older sales made inside a shift get the shift's cashier; the rest stay
     // unknown (only owners and roles allowed to see every sale see those).
@@ -610,6 +611,7 @@ const PULL_HANDLERS = {
   sale: applyPulledSale,
   sale_item: applyPulledSaleItem,
   stock_movement: applyPulledStockMovement,
+  promotion: applyPulledPromotion,
 };
 
 function applyPulledOperation(db, entityType, operation, payload) {
@@ -709,9 +711,9 @@ const createSale = (db) => db.transaction((input) => {
   for (const item of input.items) {
     const itemId = uuid();
     db.prepare(
-      `INSERT INTO sale_items (id, sale_id, product_id, item_name, category, quantity, unit_price, unit_cost, discount, created_at, updated_at, is_deleted)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
-    ).run(itemId, saleId, item.product_id || null, item.item_name, item.category || '', item.quantity, item.unit_price, item.unit_cost || 0, item.discount || 0, ts, ts);
+      `INSERT INTO sale_items (id, sale_id, product_id, item_name, category, quantity, unit_price, unit_cost, discount, promotion_id, created_at, updated_at, is_deleted)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+    ).run(itemId, saleId, item.product_id || null, item.item_name, item.category || '', item.quantity, item.unit_price, item.unit_cost || 0, cleanDiscount(item), item.promotion_id || null, ts, ts);
 
     if (item.product_id) {
       const { unitCost, shortfall } = allocateStock(db, itemId, item.product_id, item.quantity);
@@ -1537,6 +1539,27 @@ function applyPulledStockMovement(db, entityId, operation, payload) {
 // Restocked units go back to the batches the sale took them from; the allocation shrinks either way,
 // so voiding later can't put them back twice. Works offline; uploaded at protocol 5.
 // ---------------------------------------------------------------------------------------------
+/** A line's discount: never negative, never more than the line is worth. */
+function cleanDiscount(item) {
+  const d = money2(item.discount || 0);
+  const gross = money2(Number(item.unit_price || 0) * Number(item.quantity || 0));
+  if (!(d > 0)) return 0;
+  return Math.min(d, gross);
+}
+
+// Promotions (stage 10): the cloud's list, kept verbatim and evaluated at checkout.
+function applyPulledPromotion(db, entityId, operation, payload) {
+  const ts = nowIso();
+  db.prepare(
+    `INSERT INTO promotions (id, data, is_deleted, updated_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET data = excluded.data, is_deleted = excluded.is_deleted, updated_at = excluded.updated_at`
+  ).run(entityId, JSON.stringify(payload), operation === 'delete' || payload.is_deleted ? 1 : 0, ts);
+}
+
+function listPromotions(db) {
+  return db.prepare(`SELECT data FROM promotions WHERE is_deleted = 0`).all().map((r) => JSON.parse(r.data));
+}
+
 function returnPayload(db, returnId) {
   const r = db.prepare(`SELECT * FROM sale_returns WHERE id = ?`).get(returnId);
   if (!r) return null;
@@ -1649,6 +1672,7 @@ module.exports = {
   applyPulledOperation,
   recordDamage,
   createReturn,
+  listPromotions,
   getDayReport,
   recordStockCount,
   listStockMovements,

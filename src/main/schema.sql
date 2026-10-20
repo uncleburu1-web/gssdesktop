@@ -122,6 +122,15 @@ CREATE TABLE IF NOT EXISTS sale_return_lines (
 );
 CREATE INDEX IF NOT EXISTS idx_sale_return_lines_item ON sale_return_lines(sale_item_id);
 
+-- Promotions downloaded from the cloud (stage 10), kept as the cloud sends them (JSON) and evaluated
+-- at checkout by renderer/promotions.js, the same rules as the server.
+CREATE TABLE IF NOT EXISTS promotions (
+  id TEXT PRIMARY KEY,
+  data TEXT NOT NULL,
+  is_deleted INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
+
 -- The cashier's unfinished work. LOCAL SCRATCH SPACE: never synced, never part of the books.
 --   status 'draft'  : the cart currently on screen, saved continuously, so a crash or power cut
 --                     doesn't lose it (one row per cashier: id = 'draft:<owner>')
@@ -219,6 +228,7 @@ CREATE TABLE IF NOT EXISTS sale_items (
   unit_price REAL NOT NULL,
   unit_cost REAL NOT NULL DEFAULT 0,
   discount REAL NOT NULL DEFAULT 0,
+  promotion_id TEXT,               -- the promotion that set this line's discount (stage 10)
   stock_shortfall INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,

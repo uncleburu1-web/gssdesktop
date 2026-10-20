@@ -29,6 +29,7 @@ contextBridge.exposeInMainWorld('pos', {
   syncStatus: () => ipcRenderer.invoke('pos:syncStatus'),
   retryFailedSync: () => ipcRenderer.invoke('pos:retryFailedSync'),
   paymentMethods: () => ipcRenderer.invoke('pos:paymentMethods'),
+  promotions: () => ipcRenderer.invoke('pos:promotions'),
   saveDraft: (cart) => ipcRenderer.invoke('pos:saveDraft', cart),
   loadDraft: () => ipcRenderer.invoke('pos:loadDraft'),
   parkCart: (cart) => ipcRenderer.invoke('pos:parkCart', cart),
