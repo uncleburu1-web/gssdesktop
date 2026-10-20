@@ -81,6 +81,19 @@ app.whenReady().then(() => {
   ipcMain.handle('pos:dayReport', (_e, { date, seller = null } = {}) =>
     db.getDayReport(database, { date, seller: seesEveryone() ? (seller || null) : cartOwner() }));
 
+  // Customer returns (stage 8): owners, and roles the owner allowed 'process_return'.
+  ipcMain.handle('pos:createReturn', (_e, input) => {
+    const p = auth.getUserProfile(database);
+    if (!(p.is_owner || (p.capabilities && p.capabilities.process_return))) {
+      const err = new Error("Your role can't take returns — ask an owner or manager.");
+      err.code = 'forbidden';
+      throw err;
+    }
+    const result = db.createReturn(database, input, cartOwner());
+    syncEngine.pushNow();
+    return result;
+  });
+
   // Stock ledger (stage 4). Damage: anyone signed in, with a reason. A stock count: owners only;
   // the cloud checks the same thing again when the count is uploaded.
   ipcMain.handle('pos:recordDamage', (_e, input) => {

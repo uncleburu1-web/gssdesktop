@@ -96,6 +96,32 @@ CREATE TABLE IF NOT EXISTS stock_docs (
   synced_at TEXT
 );
 
+-- Items a customer brought back on a completed sale (stage 8). The sale itself is never rewritten:
+-- the return is its own record, uploaded as 'sale_return' (protocol 5) with the same id.
+CREATE TABLE IF NOT EXISTS sale_returns (
+  id TEXT PRIMARY KEY,
+  sale_id TEXT NOT NULL REFERENCES sales(id),
+  shift_id TEXT,
+  reason TEXT NOT NULL,
+  refund_method TEXT NOT NULL DEFAULT 'cash',
+  refund_amount REAL NOT NULL DEFAULT 0,
+  total_value REAL NOT NULL DEFAULT 0,
+  actor TEXT,
+  created_at TEXT NOT NULL,
+  synced_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sale_returns_sale ON sale_returns(sale_id);
+CREATE INDEX IF NOT EXISTS idx_sale_returns_created ON sale_returns(created_at);
+CREATE TABLE IF NOT EXISTS sale_return_lines (
+  id TEXT PRIMARY KEY,
+  return_id TEXT NOT NULL REFERENCES sale_returns(id),
+  sale_item_id TEXT NOT NULL,
+  quantity INTEGER NOT NULL,
+  value REAL NOT NULL,
+  restocked INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_sale_return_lines_item ON sale_return_lines(sale_item_id);
+
 -- The cashier's unfinished work. LOCAL SCRATCH SPACE: never synced, never part of the books.
 --   status 'draft'  : the cart currently on screen, saved continuously, so a crash or power cut
 --                     doesn't lose it (one row per cashier: id = 'draft:<owner>')

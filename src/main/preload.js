@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('pos', {
   createCustomer: (input) => ipcRenderer.invoke('pos:createCustomer', input),
   addStockBatch: (input) => ipcRenderer.invoke('pos:addStockBatch', input),
   recordDamage: (input) => ipcRenderer.invoke('pos:recordDamage', input),
+  createReturn: (input) => ipcRenderer.invoke('pos:createReturn', input),
   recordStockCount: (input) => ipcRenderer.invoke('pos:recordStockCount', input),
   listStockMovements: (params) => ipcRenderer.invoke('pos:listStockMovements', params),
   createSale: (input) => ipcRenderer.invoke('pos:createSale', input),

@@ -1,3 +1,4 @@
+import ReturnModal from './ReturnModal.jsx';
 import { useEffect, useState } from 'react';
 import { money, fmtDateTime, posErrorMessage, methodLabel, paymentsSummary, usePaymentMethods } from './format.js';
 
@@ -12,7 +13,9 @@ function ItemsSummary({ items }) {
 // so this screen got slower with every sale and eventually froze.
 const PAGE_SIZE = 100;
 
-export default function SalesHistoryScreen({ refreshKey }) {
+export default function SalesHistoryScreen({ refreshKey, canReturn = false }) {
+  const [returning, setReturning] = useState(null); // sale id being returned against
+  const [notice, setNotice] = useState('');
   const paymentMethods = usePaymentMethods();
   const [tab, setTab] = useState('completed');
   const [rows, setRows] = useState([]);
@@ -47,7 +50,12 @@ export default function SalesHistoryScreen({ refreshKey }) {
 
   async function handleDelete(id) {
     if (!confirm('Delete this sale? Stock will be restored.')) return;
-    await window.pos.deleteSale(id);
+    setError('');
+    try {
+      await window.pos.deleteSale(id);
+    } catch (err) {
+      setError(posErrorMessage(err, 'Could not delete this sale.'));
+    }
     load();
   }
 
@@ -116,6 +124,9 @@ export default function SalesHistoryScreen({ refreshKey }) {
                       {tab === 'outstanding' && (
                         <button className="btn small" onClick={() => { setPayModal(s); setPayAmount(''); setPayMethod('cash'); setPayReference(''); }}>Pay</button>
                       )}
+                      {tab === 'completed' && canReturn && (
+                        <button className="btn ghost small" onClick={() => { setNotice(''); setReturning(s.id); }}>Return</button>
+                      )}
                       <button className="btn ghost small" onClick={() => handleDelete(s.id)}>Delete</button>
                     </td>
                   </tr>
@@ -165,6 +176,11 @@ export default function SalesHistoryScreen({ refreshKey }) {
           </div>
         </div>
       )}
+      {returning && (
+        <ReturnModal saleId={returning} onClose={() => setReturning(null)}
+          onDone={(r) => { setReturning(null); setNotice(`Return recorded. Refund ${money(r.refund_amount)}.`); load(); }} />
+      )}
+      {notice && <div className="form-success" style={{ position: 'fixed', bottom: 16, right: 16, padding: '10px 14px', background: 'var(--surface)', border: '1px solid var(--good)', borderRadius: 8 }} onClick={() => setNotice('')}>{notice}</div>}
     </div>
   );
 }

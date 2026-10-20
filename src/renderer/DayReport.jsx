@@ -21,6 +21,8 @@ function reportRows(r) {
     r.sales.profit !== null ? ['Profit', money(r.sales.profit)] : null,
     r.outstanding.count ? [`Still owed (${r.outstanding.count})`, money(r.outstanding.balance)] : null,
     r.voided.count ? [`Voided sales (${r.voided.count})`, money(r.voided.paid)] : null,
+    r.returns && r.returns.count ? [`Returns (${r.returns.count})`, `-${money(r.returns.value)}`] : null,
+    r.returns && r.returns.count ? ['Net sales', money(r.sales.gross - r.returns.value), true] : null,
     { divider: true, label: 'MONEY RECEIVED' },
     ...['cash', 'transfer', 'pos'].map((m) => [`${methodLabel(m)}`, money(r.payments.by_method[m])]),
     r.payments.by_method.mobile ? [methodLabel('mobile'), money(r.payments.by_method.mobile)] : null,
@@ -28,7 +30,12 @@ function reportRows(r) {
     ['Total received', money(r.payments.total), true],
     r.cash.paid_in ? ['Cash paid in', money(r.cash.paid_in)] : null,
     r.cash.paid_out ? ['Cash paid out', `-${money(r.cash.paid_out)}`] : null,
+    ...(r.returns ? Object.entries(r.returns.by_method).map(([m, v]) => [`Refunded (${methodLabel(m)})`, `-${money(v)}`]) : []),
   ];
+  if (r.returns && r.returns.list.length) {
+    rows.push({ divider: true, label: 'RETURNS' });
+    for (const x of r.returns.list) rows.push([`${time(x.created_at)} #${x.invoice_number ?? ''} ${x.actor || ''}: ${x.reason}`, `-${money(x.refund_amount)}`]);
+  }
   if (r.cash.movements.length) {
     rows.push({ divider: true, label: 'CASH IN / OUT' });
     for (const c of r.cash.movements) {

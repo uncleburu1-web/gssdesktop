@@ -180,7 +180,7 @@ function Shell() {
         {view === 'sell' && <PosScreen onSaleComplete={() => setSaleTick((t) => t + 1)} refreshKey={saleTick} profile={profile} />}
         {view === 'products' && <ProductsScreen refreshKey={saleTick} isOwner={isOwner} profile={profile} />}
         {view === 'customers' && <CustomersScreen refreshKey={saleTick} />}
-        {view === 'history' && <SalesHistoryScreen refreshKey={saleTick} />}
+        {view === 'history' && <SalesHistoryScreen refreshKey={saleTick} canReturn={isOwner || Boolean(profile?.capabilities?.process_return)} />}
         {view === 'shift' && <ShiftScreen refreshKey={saleTick} profile={profile} />}
         {view === 'dayreport' && <DayReportScreen profile={profile} seesEveryone={seesEveryone} />}
         {view === 'printer' && <PrinterSettingsScreen profile={profile} />}

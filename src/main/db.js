@@ -642,7 +642,13 @@ function getSale(db, saleId) {
   if (!sale) return null;
   const items = db.prepare(`SELECT * FROM sale_items WHERE sale_id = ? AND is_deleted = 0 ORDER BY rowid`).all(saleId);
   const payments = db.prepare(`SELECT * FROM sale_payments WHERE sale_id = ? AND is_deleted = 0 ORDER BY rowid`).all(saleId);
-  return buildSale(sale, items, payments);
+  const built = buildSale(sale, items, payments);
+  built.returns = db.prepare(`SELECT * FROM sale_returns WHERE sale_id = ? ORDER BY created_at`).all(saleId);
+  built.returned_quantities = Object.fromEntries(db.prepare(
+    `SELECT l.sale_item_id, SUM(l.quantity) AS q FROM sale_return_lines l JOIN sale_returns r ON r.id = l.return_id
+      WHERE r.sale_id = ? GROUP BY l.sale_item_id`
+  ).all(saleId).map((r) => [r.sale_item_id, r.q]));
+  return built;
 }
 
 /** Live payments for many sales at once (same batching as loadItemsBySale). */
@@ -776,6 +782,9 @@ const createSale = (db) => db.transaction((input) => {
 const deleteSale = (db) => db.transaction((saleId) => {
   const sale = getSale(db, saleId);
   if (!sale) return null;
+  if (db.prepare(`SELECT 1 FROM sale_returns WHERE sale_id = ? LIMIT 1`).get(saleId)) {
+    throw new Error('This sale has returns recorded against it, so it cannot be deleted.');
+  }
   const ts = nowIso();
   for (const item of sale.items) {
     restoreStock(db, item.id);
@@ -976,6 +985,13 @@ function computeShiftReport(db, shift) {
   const movement = (kind) => money2(db.prepare(`SELECT COALESCE(SUM(amount), 0) AS n FROM cash_movements WHERE shift_id = ? AND kind = ?`).get(shift.id, kind).n);
   const paidIn = movement('paid_in');
   const paidOut = movement('paid_out');
+  // Money handed back for returns during this shift, by method; cash refunds leave the drawer.
+  const refundsByMethod = {};
+  for (const row of db.prepare(`SELECT refund_method AS method, SUM(refund_amount) AS amount, COUNT(*) AS n FROM sale_returns WHERE shift_id = ? GROUP BY refund_method`).all(shift.id)) {
+    refundsByMethod[row.method] = money2(row.amount);
+  }
+  const refundCount = db.prepare(`SELECT COUNT(*) AS n FROM sale_returns WHERE shift_id = ?`).get(shift.id).n;
+  const cashRefunds = refundsByMethod.cash || 0;
   const voided = db.prepare(`SELECT COUNT(*) AS n, COALESCE(SUM(amount_paid), 0) AS paid FROM sales WHERE shift_id = ? AND is_deleted = 1`).get(shift.id);
 
   return {
@@ -991,11 +1007,13 @@ function computeShiftReport(db, shift) {
       cash_sales: byMethod.cash,
       paid_in: paidIn,
       paid_out: paidOut,
-      expected: money2(shift.opening_float + byMethod.cash + paidIn - paidOut),
+      refunds: cashRefunds,
+      expected: money2(shift.opening_float + byMethod.cash + paidIn - paidOut - cashRefunds),
       counted: null,
       variance: null,
     },
     voided: { count: voided.n, paid: money2(voided.paid) },
+    refunds: { count: refundCount, total: money2(Object.values(refundsByMethod).reduce((t, v) => t + v, 0)), by_method: refundsByMethod },
     outstanding: { count: owing.length, balance: money2(owing.reduce((sum, s) => sum + s.balance_due, 0)) },
     // Every cash in/out of this drawer with its reason, so the cashier sees their money movement.
     cash_movements: db.prepare(`SELECT created_at, kind, amount, reason FROM cash_movements WHERE shift_id = ? ORDER BY created_at`).all(shift.id),
@@ -1204,6 +1222,10 @@ function reconcileUnsyncedRows(db) {
     // Damage and stock counts recorded before the cloud could take them (stage 4).
     tables.push({ table: 'stock_docs', entityType: 'stock_movement', covered: `q.entity_type = 'stock_movement' AND q.entity_id = t.id`, noSoftDelete: true });
   }
+  if (cloudSyncProtocol(db) >= 5) {
+    // Returns taken before the cloud could take them (stage 8); always after their sale (queue order).
+    tables.push({ table: 'sale_returns', entityType: 'sale_return', covered: `q.entity_type = 'sale_return' AND q.entity_id = t.id`, noSoftDelete: true });
+  }
   let queued = 0;
   for (const { table, entityType, covered, noSoftDelete } of tables) {
     const orphans = db.prepare(
@@ -1212,7 +1234,7 @@ function reconcileUnsyncedRows(db) {
          AND NOT EXISTS (SELECT 1 FROM sync_queue q WHERE ${covered})`
     ).all();
     for (const row of orphans) {
-      enqueueSync(db, { entityType, entityId: row.id, operation: 'create', payload: row });
+      enqueueSync(db, { entityType, entityId: row.id, operation: 'create', payload: entityType === 'sale_return' ? returnPayload(db, row.id) : row });
       queued += 1;
     }
   }
@@ -1303,6 +1325,14 @@ function getDayReport(db, { date, seller = null } = {}) {
       GROUP BY COALESCE(m.doc_id, m.id) ORDER BY m.created_at`
   ).all(...(seller !== null ? [from, to, seller] : [from, to]));
 
+  // Returns taken that day (by whoever took them, for a seller's own report), refunds by method.
+  const returnRows = db.prepare(
+    `SELECT r.*, s.invoice_number FROM sale_returns r JOIN sales s ON s.id = r.sale_id
+      WHERE r.created_at >= ? AND r.created_at < ? ${seller !== null ? 'AND r.actor = ?' : ''} ORDER BY r.created_at`
+  ).all(...(seller !== null ? [from, to, seller] : [from, to]));
+  const refundsByMethod = {};
+  for (const r of returnRows) refundsByMethod[r.refund_method] = money2((refundsByMethod[r.refund_method] || 0) + r.refund_amount);
+
   const itemTotals = new Map();
   for (const sale of sales) {
     for (const it of sale.items) {
@@ -1340,6 +1370,13 @@ function getDayReport(db, { date, seller = null } = {}) {
     },
     outstanding: { count: owing.length, balance: money2(owing.reduce((t, x) => t + x.balance_due, 0)) },
     voided: { count: voided.n, paid: money2(voided.paid) },
+    returns: {
+      count: returnRows.length,
+      value: money2(returnRows.reduce((t, r) => t + r.total_value, 0)),
+      refunded: money2(returnRows.reduce((t, r) => t + r.refund_amount, 0)),
+      by_method: refundsByMethod,
+      list: returnRows.map((r) => ({ created_at: r.created_at, invoice_number: r.invoice_number, actor: r.actor, reason: r.reason, refund_amount: r.refund_amount, refund_method: r.refund_method })),
+    },
     payments: { total: money2(Object.values(byMethod).reduce((t, v) => t + v, 0)), by_method: byMethod },
     cash: { paid_in: paidIn, paid_out: paidOut, movements: cashMoves },
     shifts,
@@ -1480,7 +1517,7 @@ function listStockMovements(db, { productId = null, actor = null, from = null, t
 function applyPulledStockMovement(db, entityId, operation, payload) {
   if (operation === 'delete') return;
   if (db.prepare(`SELECT 1 FROM stock_movements WHERE id = ?`).get(entityId)) return;
-  if (payload.client_ref && db.prepare(`SELECT 1 FROM stock_docs WHERE id = ?`).get(payload.client_ref)) return;
+  if (payload.client_ref && db.prepare(`SELECT 1 FROM stock_docs WHERE id = ? UNION SELECT 1 FROM sale_returns WHERE id = ?`).get(payload.client_ref, payload.client_ref)) return;
   const quantity = Number(payload.quantity) || 0;
   const batch = payload.batch_id ? db.prepare(`SELECT id, quantity_remaining FROM stock_batches WHERE id = ?`).get(payload.batch_id) : null;
   if (batch && quantity !== 0) {
@@ -1494,10 +1531,91 @@ function applyPulledStockMovement(db, entityId, operation, payload) {
     payload.reason || '', payload.actor_name || null, payload.created_at || nowIso());
 }
 
+// ---------------------------------------------------------------------------------------------
+// Customer returns (stage 8). Same rules as the cloud (sales/returns.py): completed sales only, a
+// reason, never more than sold minus already returned, refund at most the returned value.
+// Restocked units go back to the batches the sale took them from; the allocation shrinks either way,
+// so voiding later can't put them back twice. Works offline; uploaded at protocol 5.
+// ---------------------------------------------------------------------------------------------
+function returnPayload(db, returnId) {
+  const r = db.prepare(`SELECT * FROM sale_returns WHERE id = ?`).get(returnId);
+  if (!r) return null;
+  const lines = db.prepare(`SELECT sale_item_id, quantity, restocked FROM sale_return_lines WHERE return_id = ?`).all(returnId)
+    .map((l) => ({ sale_item_id: l.sale_item_id, quantity: l.quantity, restock: Boolean(l.restocked) }));
+  return { id: r.id, sale_id: r.sale_id, lines, reason: r.reason, refund_method: r.refund_method,
+    refund_amount: r.refund_amount, shift_id: r.shift_id, actor: r.actor, created_at: r.created_at };
+}
+
+function createReturn(db, { sale_id, lines, refund_method = 'cash', refund_amount = null, reason } = {}, owner = '') {
+  const why = String(reason || '').trim();
+  if (!why) throw new Error('Say why the items are being returned — a reason is required.');
+  if (!PAYMENT_METHODS.includes(refund_method)) throw new Error('Choose how the money is refunded.');
+  if (!Array.isArray(lines) || lines.length === 0) throw new Error('Choose at least one item to return.');
+  return db.transaction(() => {
+    const sale = getSale(db, sale_id);
+    if (!sale || sale.is_deleted) throw new Error('That sale no longer exists.');
+    if (sale.status !== 'completed') throw new Error('Only a fully paid sale can take returns.');
+    const items = new Map(sale.items.map((i) => [i.id, i]));
+    const wanted = [];
+    const perItem = new Map();
+    for (const line of lines) {
+      const item = items.get(line.sale_item_id);
+      if (!item) throw new Error('A returned item is not on this sale.');
+      const qty = Number(line.quantity);
+      if (!Number.isInteger(qty) || qty <= 0) throw new Error('Return whole units, at least one.');
+      perItem.set(item.id, (perItem.get(item.id) || 0) + qty);
+      wanted.push({ item, qty, restock: line.restock !== false });
+    }
+    for (const [itemId, qty] of perItem) {
+      const item = items.get(itemId);
+      const left = item.quantity - (sale.returned_quantities[itemId] || 0);
+      if (qty > left) throw new Error(`Only ${left} of ${item.item_name} can still be returned on this sale.`);
+    }
+    const valueOf = (item, qty) => money2((item.total * qty) / item.quantity);
+    const totalValue = money2(wanted.reduce((t, w) => t + valueOf(w.item, w.qty), 0));
+    const refund = refund_amount === null || refund_amount === undefined || refund_amount === '' ? totalValue : money2(refund_amount);
+    if (!(refund >= 0) || refund > totalValue) throw new Error(`The refund can be at most ${totalValue} (what those items were sold for).`);
+
+    const id = uuid();
+    const at = nowIso();
+    const actor = currentActor(db);
+    const shift = owner ? getOpenShift(db, owner) : null;
+    db.prepare(
+      `INSERT INTO sale_returns (id, sale_id, shift_id, reason, refund_method, refund_amount, total_value, actor, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(id, sale_id, shift ? shift.id : null, why, refund_method, refund, totalValue, actor, at);
+    for (const w of wanted) {
+      db.prepare(`INSERT INTO sale_return_lines (id, return_id, sale_item_id, quantity, value, restocked) VALUES (?, ?, ?, ?, ?, ?)`)
+        .run(uuid(), id, w.item.id, w.qty, valueOf(w.item, w.qty), w.restock ? 1 : 0);
+      let remaining = w.qty;
+      for (const alloc of db.prepare(`SELECT * FROM sale_allocations WHERE sale_item_id = ? ORDER BY rowid DESC`).all(w.item.id)) {
+        if (remaining <= 0) break;
+        const take = Math.min(alloc.quantity, remaining);
+        if (w.restock && alloc.batch_id) {
+          db.prepare(`UPDATE stock_batches SET quantity_remaining = quantity_remaining + ?, updated_at = ? WHERE id = ?`).run(take, at, alloc.batch_id);
+          insertLocalMovement(db, { docId: id, productId: w.item.product_id, batchId: alloc.batch_id, kind: 'return', quantity: take, reason: why, actor, at });
+        }
+        if (take === alloc.quantity) db.prepare(`DELETE FROM sale_allocations WHERE id = ?`).run(alloc.id);
+        else db.prepare(`UPDATE sale_allocations SET quantity = quantity - ? WHERE id = ?`).run(take, alloc.id);
+        remaining -= take;
+      }
+      if (w.restock && remaining > 0 && w.item.product_id) {
+        const batch = db.prepare(`SELECT id FROM stock_batches WHERE product_id = ? AND is_deleted = 0 ORDER BY received_date DESC LIMIT 1`).get(w.item.product_id);
+        if (batch) {
+          db.prepare(`UPDATE stock_batches SET quantity_remaining = quantity_remaining + ?, updated_at = ? WHERE id = ?`).run(remaining, at, batch.id);
+          insertLocalMovement(db, { docId: id, productId: w.item.product_id, batchId: batch.id, kind: 'return', quantity: remaining, reason: why, actor, at });
+        }
+      }
+    }
+    if (cloudSyncProtocol(db) >= 5) enqueueSync(db, { entityType: 'sale_return', entityId: id, operation: 'create', payload: returnPayload(db, id) });
+    return { id, refund_amount: refund, total_value: totalValue, sale: getSale(db, sale_id) };
+  })();
+}
+
 // Which local rows an acknowledged outbox row stands for (sale_payment rows have no synced_at column).
 const ACK_TABLES = {
   product: 'products', stock_batch: 'stock_batches', customer: 'customers', sale: 'sales', sale_item: 'sale_items',
-  shift: 'shifts', cash_movement: 'cash_movements', stock_movement: 'stock_docs',
+  shift: 'shifts', cash_movement: 'cash_movements', stock_movement: 'stock_docs', sale_return: 'sale_returns',
 };
 
 /** The cloud confirmed this outbox row: stamp synced_at on the local row(s) it carried. */
@@ -1530,6 +1648,7 @@ module.exports = {
   getSale,
   applyPulledOperation,
   recordDamage,
+  createReturn,
   getDayReport,
   recordStockCount,
   listStockMovements,
