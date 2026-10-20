@@ -1,3 +1,5 @@
+import { useEffect, useState } from 'react';
+
 export function money(n) {
   return '₦' + Number(n || 0).toLocaleString('en-NG', { maximumFractionDigits: 0 });
 }
@@ -32,7 +34,7 @@ export function posErrorMessage(err, fallback) {
   return (match ? match[1] : raw) || fallback;
 }
 
-const METHOD_LABELS = { cash: 'Cash', transfer: 'Transfer', pos: 'POS/Card' };
+const METHOD_LABELS = { cash: 'Cash', transfer: 'Transfer', pos: 'POS/Card', mobile: 'Mobile money', other: 'Other' };
 export function methodLabel(method) {
   return METHOD_LABELS[method] || (method ? method[0].toUpperCase() + method.slice(1) : '');
 }
@@ -40,4 +42,11 @@ export function methodLabel(method) {
 /** "Cash ₦300 · Transfer ₦500": how a sale was paid, shown wherever more than one method was used. */
 export function paymentsSummary(payments) {
   return (payments || []).map((p) => `${methodLabel(p.method)} ${money(p.amount)}`).join(' · ');
+}
+
+/** The payment methods the till offers right now (mobile money once the cloud supports it). */
+export function usePaymentMethods() {
+  const [methods, setMethods] = useState(['cash', 'transfer', 'pos']);
+  useEffect(() => { window.pos.paymentMethods?.().then((m) => { if (Array.isArray(m)) setMethods(m); }).catch(() => {}); }, []);
+  return methods;
 }

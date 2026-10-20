@@ -1,7 +1,6 @@
 import { useState } from 'react';
-import { money, methodLabel } from './format.js';
+import { money, methodLabel, usePaymentMethods } from './format.js';
 
-const METHODS = ['cash', 'transfer', 'pos'];
 const round2 = (n) => Math.round(Number(n) * 100) / 100;
 
 /**
@@ -11,6 +10,7 @@ const round2 = (n) => Math.round(Number(n) * 100) / 100;
  * same rule, so this dialog is a convenience, never the only guard.)
  */
 export default function SplitPaymentModal({ due, initial, onConfirm, onClose }) {
+  const METHODS = usePaymentMethods();
   const [lines, setLines] = useState(() => (initial && initial.length ? initial.map((p) => ({
     method: p.method, amount: String(p.amount), tendered: p.tendered ? String(p.tendered) : '', reference: p.reference || '',
   })) : []));

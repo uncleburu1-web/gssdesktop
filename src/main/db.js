@@ -862,8 +862,14 @@ function pruneSyncQueue(db) {
 // ---------------------------------------------------------------------------------------------
 // Payments
 // ---------------------------------------------------------------------------------------------
-// The three methods the cloud already knows (sales.models.Sale.PAYMENT_CHOICES).
-const PAYMENT_METHODS = ['cash', 'transfer', 'pos'];
+// The methods the cloud knows (sales.models.Sale.PAYMENT_CHOICES). Mobile money arrived with sync
+// protocol 5: the till only OFFERS it once the cloud has said it can take it (paymentMethods below).
+const PAYMENT_METHODS = ['cash', 'transfer', 'pos', 'mobile'];
+
+/** The methods to show the cashier right now. */
+function paymentMethods(db) {
+  return cloudSyncProtocol(db) >= 5 ? PAYMENT_METHODS : PAYMENT_METHODS.filter((m) => m !== 'mobile');
+}
 
 /** Money to the kobo. Float dust (0.1 + 0.2) must never decide whether payments "add up". */
 const money2 = (n) => Math.round(Number(n) * 100) / 100;
@@ -875,7 +881,7 @@ function deviceCode(db) {
 
 /** One validated payment line. Throws a plain-English message the cashier can act on. */
 function cleanPayment(p) {
-  if (!p || !PAYMENT_METHODS.includes(p.method)) throw new Error('Choose a valid payment method (cash, transfer or card).');
+  if (!p || !PAYMENT_METHODS.includes(p.method)) throw new Error('Choose a valid payment method (cash, transfer, card or mobile money).');
   const amount = money2(p.amount);
   if (!Number.isFinite(amount) || amount <= 0) throw new Error('Each payment needs an amount greater than zero.');
   let tendered = null;
@@ -961,7 +967,7 @@ function computeShiftReport(db, shift) {
 
   // Payments taken DURING this shift, whenever the sale itself was made (an installment collected
   // today belongs to today's drawer). Payments on deleted (voided) sales are excluded: that money went back.
-  const byMethod = { cash: 0, transfer: 0, pos: 0 };
+  const byMethod = { cash: 0, transfer: 0, pos: 0, mobile: 0 };
   for (const row of db.prepare(
     `SELECT p.method AS method, SUM(p.amount) AS amount FROM sale_payments p JOIN sales s ON s.id = p.sale_id
      WHERE p.shift_id = ? AND p.is_deleted = 0 AND s.is_deleted = 0 GROUP BY p.method`
@@ -979,7 +985,7 @@ function computeShiftReport(db, shift) {
       gross: money2(built.reduce((sum, s) => sum + s.total, 0)),
       discounts: money2(built.reduce((sum, s) => sum + s.items.reduce((d, i) => d + Number(i.discount || 0), 0), 0)),
     },
-    payments: { total: money2(byMethod.cash + byMethod.transfer + byMethod.pos), by_method: byMethod },
+    payments: { total: money2(byMethod.cash + byMethod.transfer + byMethod.pos + byMethod.mobile), by_method: byMethod },
     cash: {
       opening_float: shift.opening_float,
       cash_sales: byMethod.cash,
@@ -1140,6 +1146,17 @@ function getSyncQueueStats(db) {
 // entity is still never created twice.
 const REUSED_ID_MARKER = 'already used for different content';
 
+/**
+ * Something that matters only for the audit trail (sync protocol 5), e.g. a cashier retrying failed
+ * changes. Queued like any change, so it reaches the owner's Audit log even if recorded offline.
+ */
+function recordAuditEvent(db, action, { summary = '', reason = '', data = {} } = {}) {
+  if (cloudSyncProtocol(db) < 5) return;
+  const id = uuid();
+  enqueueSync(db, { entityType: 'audit_event', entityId: id, operation: 'create',
+    payload: { id, action, summary, reason, data, actor: currentActor(db), created_at: nowIso() } });
+}
+
 const retryFailedSync = (db) => db.transaction(() => {
   const reused = db.prepare(`SELECT id FROM sync_queue WHERE status = 'failed' AND last_error LIKE ?`)
     .all(`%${REUSED_ID_MARKER}%`);
@@ -1264,7 +1281,7 @@ function getDayReport(db, { date, seller = null } = {}) {
        FROM sale_payments p JOIN sales s ON s.id = p.sale_id LEFT JOIN shifts sh ON sh.id = p.shift_id
       WHERE p.paid_at >= ? AND p.paid_at < ? AND p.is_deleted = 0 AND s.is_deleted = 0`
   ).all(from, to).filter((p) => seller === null || p.taken_by === seller);
-  const byMethod = { cash: 0, transfer: 0, pos: 0, other: 0 };
+  const byMethod = { cash: 0, transfer: 0, pos: 0, mobile: 0, other: 0 };
   for (const p of payments) byMethod[p.method in byMethod ? p.method : 'other'] += p.amount;
   for (const k of Object.keys(byMethod)) byMethod[k] = money2(byMethod[k]);
 
@@ -1536,6 +1553,8 @@ module.exports = {
   discardParked,
   getSyncQueueStats,
   retryFailedSync,
+  recordAuditEvent,
+  paymentMethods,
   reconcileUnsyncedRows,
   markEntitySynced,
 };

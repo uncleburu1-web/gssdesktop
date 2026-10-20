@@ -79,7 +79,7 @@ export default function ShiftScreen({ refreshKey, profile }) {
               <Stat label="Opening float" value={money(current.cash.opening_float)} />
               <Stat label="Sales made" value={String(current.sales.count)} />
               <Stat label="Gross sales" value={money(current.sales.gross)} />
-              {['cash', 'transfer', 'pos'].map((m) => <Stat key={m} label={`${methodLabel(m)} received`} value={money(current.payments.by_method[m])} />)}
+              {['cash', 'transfer', 'pos', ...(current.payments.by_method.mobile ? ['mobile'] : [])].map((m) => <Stat key={m} label={`${methodLabel(m)} received`} value={money(current.payments.by_method[m])} />)}
             </div>
             {current.cash_movements && current.cash_movements.length > 0 && (
               <div style={{ marginBottom: 12 }}>

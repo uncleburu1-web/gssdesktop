@@ -164,8 +164,10 @@ app.whenReady().then(() => {
   );
   ipcMain.handle('pos:syncStatus', () => syncEngine.getStatus());
   // Puts every change the cloud rejected (or that gave up) back in line and tries again now.
+  ipcMain.handle('pos:paymentMethods', () => db.paymentMethods(database));
   ipcMain.handle('pos:retryFailedSync', () => {
     const retried = db.retryFailedSync(database);
+    if (retried > 0) db.recordAuditEvent(database, 'sync.retry', { summary: `Retried ${retried} change(s) that had failed to sync`, data: { retried } });
     syncEngine.pushNow();
     return retried;
   });

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { money, fmtDateTime, posErrorMessage, methodLabel, paymentsSummary } from './format.js';
+import { money, fmtDateTime, posErrorMessage, methodLabel, paymentsSummary, usePaymentMethods } from './format.js';
 
 function ItemsSummary({ items }) {
   if (!items || items.length === 0) return '—';
@@ -13,6 +13,7 @@ function ItemsSummary({ items }) {
 const PAGE_SIZE = 100;
 
 export default function SalesHistoryScreen({ refreshKey }) {
+  const paymentMethods = usePaymentMethods();
   const [tab, setTab] = useState('completed');
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -147,7 +148,7 @@ export default function SalesHistoryScreen({ refreshKey }) {
               <div className="field">
                 <label htmlFor="pay-method">Paid by</label>
                 <select id="pay-method" value={payMethod} onChange={(e) => setPayMethod(e.target.value)}>
-                  {['cash', 'transfer', 'pos'].map((m) => <option key={m} value={m}>{methodLabel(m)}</option>)}
+                  {paymentMethods.map((m) => <option key={m} value={m}>{methodLabel(m)}</option>)}
                 </select>
               </div>
               {payMethod !== 'cash' && (

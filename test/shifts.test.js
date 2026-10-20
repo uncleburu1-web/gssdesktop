@@ -49,7 +49,7 @@ test('CASH EXPECTED = float + cash taken - nothing for change given back + paid 
     assert.equal(live.cash.cash_sales, 1300);               // 1000 + 300: what stayed in the drawer
     assert.equal(live.cash.paid_in, 400); assert.equal(live.cash.paid_out, 150);
     assert.equal(live.cash.expected, 5000 + 1300 + 400 - 150);
-    assert.deepEqual(live.payments.by_method, { cash: 1300, transfer: 1000, pos: 700 });
+    assert.deepEqual(live.payments.by_method, { cash: 1300, transfer: 1000, pos: 700, mobile: 0 });
     assert.equal(live.sales.count, 3); assert.equal(live.sales.gross, 3000);
   } finally { cleanup(); }
 });

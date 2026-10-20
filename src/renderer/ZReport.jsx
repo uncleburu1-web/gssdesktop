@@ -18,6 +18,7 @@ function reportRows(r) {
     r.voided.count ? [`Voided sales (${r.voided.count})`, money(r.voided.paid)] : null,
     { divider: true },
     ...['cash', 'transfer', 'pos'].map((m) => [`${methodLabel(m)} received`, money(r.payments.by_method[m])]),
+    r.payments.by_method.mobile ? [`${methodLabel('mobile')} received`, money(r.payments.by_method.mobile)] : null,
     ['Total received', money(r.payments.total), true],
     { divider: true },
     ['Opening float', money(r.cash.opening_float)],

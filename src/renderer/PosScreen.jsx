@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { money, posErrorMessage, methodLabel, paymentsSummary } from './format.js';
+import { money, posErrorMessage, methodLabel, paymentsSummary, usePaymentMethods } from './format.js';
 import { Icons } from './Icons.jsx';
 import CashCalculator from './CashCalculator.jsx';
 import SplitPaymentModal from './SplitPaymentModal.jsx';
@@ -21,6 +21,7 @@ function newLine(product) {
 }
 
 export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
+  const paymentMethods = usePaymentMethods();
   const [catalog, setCatalog] = useState([]);
   const [loadingCatalog, setLoadingCatalog] = useState(true);
   const [search, setSearch] = useState('');
@@ -373,9 +374,9 @@ export default function PosScreen({ onSaleComplete, refreshKey, profile }) {
             </div>
           ) : (
             <div className="pay-methods">
-              {['cash', 'transfer', 'pos'].map((m) => (
+              {paymentMethods.map((m) => (
                 <button key={m} type="button" className={`pay-method ${paymentMethod === m ? 'active' : ''}`} onClick={() => setPaymentMethod(m)}>
-                  {m === 'pos' ? 'POS/Card' : m[0].toUpperCase() + m.slice(1)}
+                  {methodLabel(m)}
                 </button>
               ))}
               <button type="button" className="pay-method" disabled={installment || subtotal <= 0} onClick={() => setSplitOpen(true)}>Split</button>
