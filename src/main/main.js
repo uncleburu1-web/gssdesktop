@@ -245,8 +245,13 @@ app.whenReady().then(() => {
     });
   }));
 
-  // Restaurant screens (hub till): one IPC channel with a fixed list of actions; kitchen printing.
-  require('./restaurant/ipc').register({ ipcMain, database, auth, BrowserWindow });
+  // Restaurant (hub till only): one IPC channel with a fixed list of actions, kitchen printing, and
+  // the local server for kitchen screens on the shop's Wi-Fi (runs only on the branch's hub).
+  require('./restaurant/ipc').register({
+    ipcMain, database, auth, BrowserWindow, appVersion: app.getVersion(),
+    cloudStatus: () => syncEngine.getStatus().cloudSync.state,
+    onChange: () => syncEngine.pushNow(),
+  });
 
   createWindow();
   // Passed as a getter, not the value itself, since a user can close and

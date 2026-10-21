@@ -20,12 +20,15 @@ class FakeWindow {
   destroy() { this.destroyed = true; }
 }
 
+const lans = [];
 function wire(db, profile) {
   let handler;
-  ipc.register({ ipcMain: { handle: (ch, fn) => { assert.equal(ch, 'restaurant:call'); handler = fn; } }, database: db,
-    auth: { getUserProfile: () => profile.current }, BrowserWindow: FakeWindow });
+  const { lan } = ipc.register({ ipcMain: { handle: (ch, fn) => { assert.equal(ch, 'restaurant:call'); handler = fn; } }, database: db,
+    auth: { getUserProfile: () => profile.current }, BrowserWindow: FakeWindow, lanOptions: { port: 0, host: '127.0.0.1' } });
+  lans.push(lan);
   return (action, key, ...args) => handler(null, action, key, ...args);
 }
+test.afterEach(async () => { while (lans.length) await lans.pop().stop(); });
 
 test('screens can call only the listed actions, as the signed-in person', async () => {
   const { db, cleanup } = hub();
