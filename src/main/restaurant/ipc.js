@@ -9,6 +9,7 @@ const printing = require('./printing');
 const store = require('./store');
 
 function contextFor(profile) {
+  if (!profile || !profile.username) throw new store.RestaurantError('not_signed_in', 'Sign in first.', 401);
   return {
     user: profile.username || '',
     role: profile.role || 'seller',
@@ -69,10 +70,14 @@ function register({ ipcMain, database, auth, BrowserWindow }) {
   const kickPrinting = () => printing.runQueue(database, printHtml).catch((e) => console.warn('[restaurant] printing stopped:', e.message));
 
   ipcMain.handle('restaurant:call', (_e, action, key, ...args) => {
+    // `status` tells the screens whether this till is the hub (and why not), so they can say so.
+    if (action === 'status') return { ok: true, data: store.hubStatus(database) };
     const fn = ACTIONS[action];
     if (!fn) return { ok: false, error: { code: 'unknown_action', message: 'Unknown action.' } };
     try {
-      const data = fn(database, contextFor(auth.getUserProfile(database)), key || null, ...args);
+      const ctx = contextFor(auth.getUserProfile(database));
+      store.assertHub(database); // only the branch's hub runs the restaurant
+      const data = fn(database, ctx, key || null, ...args);
       kickPrinting();
       return { ok: true, data };
     } catch (e) {
@@ -83,7 +88,7 @@ function register({ ipcMain, database, auth, BrowserWindow }) {
       return { ok: false, error: { code: 'unexpected', message: 'Something went wrong. Nothing was changed.' } };
     }
   });
-  kickPrinting();
+  if (store.hubStatus(database).is_hub) kickPrinting();
 }
 
 module.exports = { register, contextFor, ACTIONS, makePrintHtml };

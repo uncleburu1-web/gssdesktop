@@ -70,3 +70,24 @@ test('bad input from a screen is answered plainly and changes nothing', () => {
     assert.equal(db.prepare(`SELECT COUNT(*) n FROM r_orders`).get().n, 0);
   } finally { cleanup(); }
 });
+
+test('only the branch hub runs the restaurant; anyone signed out is refused', () => {
+  const profile = { current: { username: 'ada', is_owner: true } };
+  for (const [opts, code] of [[{ hubDevice: 'another-till' }, 'not_the_hub'], [{ hubDevice: null }, 'no_hub'], [{ modules: ['retail'] }, 'module_disabled']]) {
+    const { db, cleanup } = hub(opts);
+    try {
+      const call = wire(db, profile);
+      const r = call('openOrder', null, { service_type: 'takeaway' });
+      assert.deepEqual([r.ok, r.error.code, r.error.status], [false, code, 403], code);
+      assert.equal(call('menu', null).error.code, code, 'reads too: a non-hub till would show empty tables');
+      assert.equal(call('status', null).data.is_hub, false);
+      assert.equal(db.prepare(`SELECT COUNT(*) n FROM r_orders`).get().n, 0);
+    } finally { cleanup(); }
+  }
+  const { db, cleanup } = hub();
+  try {
+    const call = wire(db, { current: null });
+    assert.deepEqual([call('openOrder', null, { service_type: 'takeaway' }).error.code], ['not_signed_in']);
+    assert.equal(call('status', null).data.is_hub, true);
+  } finally { cleanup(); }
+});

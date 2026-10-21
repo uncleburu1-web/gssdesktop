@@ -3,6 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { dbm } = require('./helpers');
+const { getOrCreateDeviceId } = require('../src/main/device');
 
 const ID = {
   area: 'a1', t1: 'tbl-1', t2: 'tbl-2', kitchen: 'st-kitchen', bar: 'st-bar', grill: 'st-grill',
@@ -12,13 +13,16 @@ const ID = {
   vat: 'tax-vat',
 };
 
-function hub({ protocol = 6, service = '10', servedRule = false } = {}) {
+function hub({ protocol = 6, service = '10', servedRule = false, hubDevice = 'this', modules = ['retail', 'restaurant'] } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hub-'));
   const file = path.join(dir, 'pos.db');
   const db = dbm.openDb(file);
   dbm.setSetting(db, 'cloud_sync_protocol', String(protocol));
+  dbm.setSetting(db, 'shop_settings', JSON.stringify({ name: 'Test Kitchen', modules }));
+  // By default this till IS the branch's hub, as the owner would set it in the cloud.
+  const hubDeviceId = hubDevice === 'this' ? getOrCreateDeviceId(db) : hubDevice;
   const pull = (type, payload) => dbm.applyPulledOperation(db, type, 'update', payload);
-  pull('restaurant_settings', { id: 's1', service_charge_rate: service, service_charge_types: ['dine_in'], require_served_before_payment: servedRule, order_number_prefix: 'K-', business_day_starts_at: '05:00' });
+  pull('restaurant_settings', { id: 's1', hub_device_id: hubDeviceId, service_charge_rate: service, service_charge_types: ['dine_in'], require_served_before_payment: servedRule, order_number_prefix: 'K-', business_day_starts_at: '05:00' });
   pull('dining_area', { id: ID.area, name: 'Hall', sort: 0, is_active: true });
   pull('restaurant_table', { id: ID.t1, area_id: ID.area, label: 'T1', seats: 4, sort: 1, is_active: true });
   pull('restaurant_table', { id: ID.t2, area_id: ID.area, label: 'T2', seats: 2, sort: 2, is_active: true });

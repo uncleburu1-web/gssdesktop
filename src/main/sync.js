@@ -424,6 +424,7 @@ function startSyncEngine(db, onDataChanged) {
       if (restaurantEngine.reconcileOrders(db) > 0) setImmediate(() => pushNow());
     }
     if (protocol >= 4 && !getSetting(db, 'stock_movements_backfilled')) await backfillStockMovements();
+    refreshBranchModules(firstBody.modules);
     if (isRestaurantBranch()) await pullRestaurantConfig();
     // Cursor from the SERVER's clock, not this machine's. next_since (from the FIRST page, the
     // earliest read) is already moved back behind the read, so a row committed while this pull was
@@ -466,7 +467,22 @@ function startSyncEngine(db, onDataChanged) {
     if (changed.length > 0) onDataChanged?.(changed);
   }
 
-  /** Is this till's branch a restaurant branch? (modules come from /api/me at sign-in) */
+  /**
+   * The branch's modules as the cloud has them now. Sign-in saves them too, but an owner can switch
+   * the restaurant on or off at any time; the cloud announces that live, so the till pulls and picks
+   * it up here within seconds. An older cloud does not send `modules`: the sign-in value stays.
+   */
+  function refreshBranchModules(modules) {
+    if (!Array.isArray(modules)) return;
+    let shop;
+    try { shop = JSON.parse(getSetting(db, 'shop_settings') || 'null'); } catch { shop = null; }
+    if (!shop) return;
+    const next = [...modules].sort();
+    if (JSON.stringify([...(shop.modules || [])].sort()) === JSON.stringify(next)) return;
+    setSetting(db, 'shop_settings', JSON.stringify({ ...shop, modules: next }));
+  }
+
+  /** Is this till's branch a restaurant branch? (modules from sign-in, kept current by the pull) */
   function isRestaurantBranch() {
     try {
       const shop = JSON.parse(getSetting(db, 'shop_settings') || '{}');

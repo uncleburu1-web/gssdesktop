@@ -109,6 +109,31 @@ function taxRules(db) {
   }));
 }
 
+/**
+ * Is this till the branch's restaurant hub? One hub per branch (the owner picks it in the cloud,
+ * RestaurantSettings.hub_device): only the hub takes orders, so two tills can never each hold a
+ * different set of open tables.
+ */
+function hubStatus(db) {
+  const setting = (key) => { const r = db.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key); return r ? r.value : null; };
+  let modules = [];
+  try { modules = (JSON.parse(setting('shop_settings') || '{}') || {}).modules || []; } catch { modules = []; }
+  const s = db.prepare(`SELECT hub_device_id FROM r_settings WHERE is_deleted = 0 LIMIT 1`).get();
+  const hub = (s && s.hub_device_id) || null;
+  const device = setting('device_id');
+  const restaurant = modules.includes('restaurant');
+  // is_hub: this till runs the restaurant right now (switched-off module = nobody does).
+  return { restaurant, hub_device_id: hub, device_id: device, is_hub: Boolean(restaurant && hub && device && hub === device) };
+}
+
+function assertHub(db) {
+  const h = hubStatus(db);
+  if (!h.restaurant) throw new RestaurantError('module_disabled', 'This branch does not use the restaurant.', 403);
+  if (!h.hub_device_id) throw new RestaurantError('no_hub', 'No till is the restaurant hub yet. The owner chooses it in the restaurant settings.', 403);
+  if (!h.is_hub) throw new RestaurantError('not_the_hub', 'This till is not the restaurant hub. Orders are taken on the hub till.', 403);
+  return h;
+}
+
 function isSoldOut(db, menuItemId, businessDate) {
   return Boolean(db.prepare(`SELECT 1 FROM r_sold_out WHERE menu_item_id = ? AND business_date = ?`).get(menuItemId, businessDate));
 }
@@ -183,5 +208,5 @@ function prune(db, now = Date.now()) {
 
 module.exports = {
   RestaurantError, ensureSchema, applyPulled, PULL_TYPES, settings, activeStationIds, station, menuItem, taxRules,
-  isSoldOut, businessDate, nextNumber, emit, eventsAfter, onceForKey, prune, uuid, nowIso,
+  hubStatus, assertHub, isSoldOut, businessDate, nextNumber, emit, eventsAfter, onceForKey, prune, uuid, nowIso,
 };

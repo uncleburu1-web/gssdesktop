@@ -2,7 +2,8 @@
  * Restaurant, end to end, against a real server (gss `restaurant` branch) and a real hub till:
  *
  *   1. The owner switches the restaurant module on and sets the restaurant up through the cloud API.
- *   2. A hub till signs in, pulls that set-up, and becomes the branch's hub.
+ *   2. The till (signed in BEFORE the restaurant was switched on) learns it from the pull, pulls the
+ *      set-up, and becomes the branch's hub; a second till in the branch is refused.
  *   3. With the server STOPPED (no internet): a full table-service order on the hub — open, order with
  *      modifiers, send (kitchen + bar), kitchen screen, serve, bill, cash payment, close.
  *   4. The hub's bill equals the cloud's Python engine on the same lines with the cloud's own rates.
@@ -23,6 +24,7 @@ const os = require('os'); const fs = require('fs'); const path = require('path')
 const { execSync } = require('child_process');
 const dbm = require(D + '/src/main/db'); const auth = require(D + '/src/main/auth'); const sync = require(D + '/src/main/sync');
 const engine = require(D + '/src/main/restaurant/engine');
+const rstore = require(D + '/src/main/restaurant/store');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let fails = 0;
@@ -52,6 +54,14 @@ async function login(username) {
 const list = (d) => (Array.isArray(d) ? d : d.results);
 
 (async () => {
+  // ---- 0. A till signs in while the branch is still only a supermarket --------------------------
+  const db = dbm.openDb(path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'hub-')), 'pos.db'));
+  await auth.login(db, 'coowner', 'pass12345');
+  check(!JSON.parse(dbm.getSetting(db, 'shop_settings')).modules.includes('restaurant'), 'a supermarket till signs in (no restaurant yet)');
+  const engineSync = sync.startSyncEngine(db, () => {});
+  const settle = async () => { for (let i = 0; i < 3; i++) { await engineSync.pushNow(); await engineSync.pullNow(); await sleep(300); } };
+  await settle();
+
   // ---- 1. Owner sets the restaurant up in the cloud --------------------------------------------
   const ceo = await login('ceo');
   const branches = list(await api(ceo, 'GET', '/branches/'));
@@ -77,19 +87,28 @@ const list = (d) => (Array.isArray(d) ? d : d.results);
   await api(ceo, 'PUT', '/restaurant/settings/', { service_charge_rate: '10', service_charge_types: ['dine_in'] }, store);
   check(true, 'menu, modifiers, tables, stations, VAT and service charge set up through the API');
 
-  // ---- 2. The hub till pulls it and becomes the hub ---------------------------------------------
-  const db = dbm.openDb(path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'hub-')), 'pos.db'));
-  await auth.login(db, 'coowner', 'pass12345');
-  const engineSync = sync.startSyncEngine(db, () => {});
-  const settle = async () => { for (let i = 0; i < 3; i++) { await engineSync.pushNow(); await engineSync.pullNow(); await sleep(300); } };
+  // ---- 2. The till pulls it and becomes the hub -------------------------------------------------
   await settle();
-  check(JSON.parse(dbm.getSetting(db, 'shop_settings')).modules.includes('restaurant'), 'the till knows its branch is a restaurant');
+  check(JSON.parse(dbm.getSetting(db, 'shop_settings')).modules.includes('restaurant'), 'the till learns from the pull that its branch is now a restaurant (no new sign-in)');
+  check(rstore.hubStatus(db).hub_device_id === null && (() => { try { rstore.assertHub(db); return false; } catch (e) { return e.code === 'no_hub'; } })(),
+    'until the owner picks a hub, the till refuses restaurant work (no_hub)');
   const pulled = db.prepare(`SELECT (SELECT COUNT(*) FROM r_items) items, (SELECT COUNT(*) FROM r_tables) tables, (SELECT COUNT(*) FROM r_stations) stations,
                              (SELECT is_active FROM r_tax_rules) vat, (SELECT service_charge_rate FROM r_settings) service`).get();
   check(pulled.items === 2 && pulled.tables === 2 && pulled.stations === 2 && pulled.vat === 1 && Number(pulled.service) === 10,
     'the hub pulled the whole set-up', JSON.stringify({ ...pulled }));
   const hubSet = await api(ceo, 'PUT', '/restaurant/settings/hub/', { device_id: dbm.getSetting(db, 'device_id') }, store);
   check(hubSet.hub_device === dbm.getSetting(db, 'device_id'), 'the owner makes this till the hub');
+  await settle();
+  check(rstore.hubStatus(db).is_hub, 'the till learns it is the hub');
+  // A second till in the same branch (another PC, signed in by a seller) must not take orders.
+  const other = dbm.openDb(path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'till2-')), 'pos.db'));
+  await auth.login(other, 'sade', 'pass12345');
+  const otherSync = sync.startSyncEngine(other, () => {});
+  for (let i = 0; i < 2; i++) { await otherSync.pullNow(); await sleep(300); }
+  let refused = null; try { rstore.assertHub(other); } catch (e) { refused = e.code; }
+  check(refused === 'not_the_hub' && db.prepare(`SELECT COUNT(*) n FROM r_items`).get().n === other.prepare(`SELECT COUNT(*) n FROM r_items`).get().n,
+    'a second till in the branch has the menu but is refused as not the hub', refused);
+  otherSync.stop();
 
   // ---- 3. Internet down: a full table-service order on the hub ----------------------------------
   execSync(`${SERVER_CMD} stop`, { stdio: 'ignore' });
