@@ -31,7 +31,7 @@ function need(ctx, capability) {
 }
 
 function audit(db, action, summary, reason = '', data = {}) {
-  tillDb().recordAuditEvent(db, action, { summary, reason, data });
+  store.audit(db, action, { summary, reason, data }); // kept on the hub; uploaded from protocol 6
 }
 
 function getOrderRow(db, orderId) {
@@ -703,10 +703,12 @@ function queueOrderDoc(db, orderId) {
   return true;
 }
 
+/** After the cloud upgrades to protocol 6: queue finished orders and audit entries it could not take before. */
 function reconcileOrders(db) {
   if (tillDb().cloudSyncProtocol(db) < ORDER_PROTOCOL) return 0;
-  return db.transaction(() => db.prepare(`SELECT id FROM r_orders WHERE status IN ('closed', 'cancelled') AND queued_at IS NULL`).all()
+  const orders = db.transaction(() => db.prepare(`SELECT id FROM r_orders WHERE status IN ('closed', 'cancelled') AND queued_at IS NULL`).all()
     .filter((o) => queueOrderDoc(db, o.id)).length)();
+  return orders + store.queuePendingAudit(db);
 }
 
 module.exports = {

@@ -165,6 +165,16 @@ const list = (d) => (Array.isArray(d) ? d : d.results);
   check(engine.orderView(db, second.id).items[0].unit_price === '1500.00' && engine.orderView(db, third.id).items[0].unit_price === '2000.00',
     'the open order keeps its price; a new order gets the new one');
 
+  // ---- 5b. Audited actions while online with today's cloud (protocol 5) -----------------------
+  // The cloud accepts only a few till audit actions before protocol 6; restaurant ones must wait on
+  // the hub instead of becoming uploads the cloud refuses.
+  engine.setSoldOut(db, jollof.id, true, owner);
+  require(D + '/src/main/restaurant/printing').reprint(db, db.prepare(`SELECT id FROM r_tickets LIMIT 1`).get().id, owner);
+  await settle();
+  const failed = db.prepare(`SELECT COUNT(*) n FROM sync_queue WHERE status = 'failed'`).get().n;
+  const waiting = db.prepare(`SELECT COUNT(*) n FROM r_audit WHERE queued_at IS NULL`).get().n;
+  check(failed === 0 && waiting >= 2, 'sold-out and a reprint are audited on the hub, and nothing fails to upload', `failed ${failed}, kept ${waiting}`);
+
   // ---- 6. The cashier's Z-report -------------------------------------------------------------
   const z = dbm.getShiftReport(db, dbm.getOpenShift(db, 'coowner').id);
   check(z.restaurant && z.restaurant.takings === 11162.5 && z.cash.expected === 2000 + 11162.5, 'the Z-report counts the restaurant cash',

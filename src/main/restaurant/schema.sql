@@ -116,6 +116,14 @@ CREATE TABLE IF NOT EXISTS r_events (
   entity_type TEXT, entity_id TEXT, data TEXT NOT NULL DEFAULT '{}', at TEXT NOT NULL
 );
 
+-- Restaurant audit entries (voids, discounts, table moves, cancellations, overrides, sold-out,
+-- reprints). Kept on the hub and uploaded as audit_event only to a cloud that speaks protocol 6: an
+-- older cloud accepts just three till audit actions and would refuse these, leaving failed uploads.
+CREATE TABLE IF NOT EXISTS r_audit (
+  id TEXT PRIMARY KEY, action TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '',
+  data TEXT NOT NULL DEFAULT '{}', actor TEXT, created_at TEXT NOT NULL, queued_at TEXT
+);
+
 -- Idempotency: a repeated request with the same key gets the first answer, never a second change.
 CREATE TABLE IF NOT EXISTS r_requests (
   key TEXT PRIMARY KEY, op TEXT NOT NULL, request_hash TEXT NOT NULL, response TEXT NOT NULL, created_at TEXT NOT NULL

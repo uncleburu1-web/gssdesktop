@@ -308,6 +308,33 @@ test('an older cloud cannot take orders yet: they wait on the hub and go up once
   } finally { cleanup(); }
 });
 
+test('an older cloud is never sent restaurant audit entries it would refuse; they go up once it upgrades', () => {
+  // Today's cloud (protocol 5) accepts only three till audit actions; anything else would sit in the
+  // outbox as a failed upload for ever.
+  const { db, cleanup } = hub({ protocol: 5 });
+  try {
+    dbm.setSetting(db, 'user_profile', JSON.stringify({ username: 'ada' }));
+    const o = engine.openOrder(db, { service_type: 'dine_in', table_id: ID.t1 }, owner);
+    engine.addItems(db, o.id, [{ menu_item_id: ID.chapman, quantity: 2 }], owner);
+    engine.sendToKitchen(db, o.id, owner);
+    engine.voidItem(db, engine.orderView(db, o.id).items[0].id, { quantity: 1, reason: 'Customer changed mind' }, owner);
+    engine.moveTable(db, o.id, ID.t2, owner);
+    engine.setSoldOut(db, ID.jollof, true, owner);
+    assert.equal(queued(db, 'audit_event').length, 0, 'nothing queued for a cloud that cannot take it');
+    const kept = db.prepare(`SELECT action, actor FROM r_audit ORDER BY created_at, rowid`).all().map((r) => ({ ...r }));
+    assert.deepEqual(kept.map((r) => r.action), ['restaurant.item_voided', 'restaurant.table_moved', 'restaurant.sold_out']);
+    assert.ok(kept.every((r) => r.actor === 'ada'), 'who did it is kept for later');
+
+    dbm.setSetting(db, 'cloud_sync_protocol', '6');
+    assert.equal(engine.reconcileOrders(db), 3, 'the open order stays; the three audit entries go up');
+    const up = queued(db, 'audit_event').map((q) => JSON.parse(q.payload));
+    assert.deepEqual(up.map((p) => [p.action, p.actor]), kept.map((r) => [r.action, r.actor]));
+    assert.equal(engine.reconcileOrders(db), 0, 'never twice');
+    engine.moveTable(db, o.id, ID.t1, owner);
+    assert.equal(queued(db, 'audit_event').length, 4, 'from protocol 6 on, straight away');
+  } finally { cleanup(); }
+});
+
 test('a hub restart mid-order loses nothing and the screens can catch up', () => {
   const { db, file, cleanup } = hub();
   db.close();

@@ -146,7 +146,7 @@ function reprint(db, ticketId, ctx, key) {
     const id = uuid();
     db.prepare(`INSERT INTO r_print_jobs (id, ticket_id, station_id, kind, status, created_at, requested_by) VALUES (?, ?, ?, 'copy', 'queued', ?, ?)`)
       .run(id, ticketId, t.station_id, nowIso(), ctx.user);
-    tillDb().recordAuditEvent(db, 'restaurant.ticket_reprinted', { summary: `Ticket ${t.number} (order ${t.order_number}) reprinted`, data: { ticket_id: ticketId } });
+    store.audit(db, 'restaurant.ticket_reprinted', { summary: `Ticket ${t.number} (order ${t.order_number}) reprinted`, data: { ticket_id: ticketId } });
     return { job_id: id };
   }))();
 }

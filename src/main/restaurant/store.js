@@ -200,6 +200,40 @@ function onceForKey(db, key, op, request, fn) {
   return response;
 }
 
+/**
+ * Record a restaurant audit entry, in the caller's transaction. Always kept on the hub; queued for
+ * the cloud only when it accepts restaurant audit actions (protocol 6, as order_doc). Earlier
+ * entries are queued by queuePendingAudit() once the cloud upgrades.
+ */
+const AUDIT_PROTOCOL = 6;
+function audit(db, action, { summary = '', reason = '', data = {} } = {}) {
+  const tillDb = require('../db');
+  const profile = db.prepare(`SELECT value FROM app_settings WHERE key = 'user_profile'`).get();
+  let actor = null;
+  try { actor = profile ? JSON.parse(profile.value).username || null : null; } catch { actor = null; }
+  const id = uuid();
+  db.prepare(`INSERT INTO r_audit (id, action, summary, reason, data, actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, action, String(summary), String(reason || ''), JSON.stringify(data || {}), actor, nowIso());
+  if (tillDb.cloudSyncProtocol(db) >= AUDIT_PROTOCOL) queueAudit(db, id);
+  return id;
+}
+
+function queueAudit(db, id) {
+  const r = db.prepare(`SELECT * FROM r_audit WHERE id = ? AND queued_at IS NULL`).get(id);
+  if (!r) return false;
+  require('../db').enqueueSync(db, { entityType: 'audit_event', entityId: r.id, operation: 'create',
+    payload: { id: r.id, action: r.action, summary: r.summary, reason: r.reason, data: JSON.parse(r.data), actor: r.actor, created_at: r.created_at } });
+  db.prepare(`UPDATE r_audit SET queued_at = ? WHERE id = ?`).run(nowIso(), r.id);
+  return true;
+}
+
+/** After the cloud upgrades to protocol 6: queue the entries recorded while it could not take them. */
+function queuePendingAudit(db) {
+  if (require('../db').cloudSyncProtocol(db) < AUDIT_PROTOCOL) return 0;
+  return db.transaction(() => db.prepare(`SELECT id FROM r_audit WHERE queued_at IS NULL ORDER BY created_at, rowid`).all()
+    .filter((r) => queueAudit(db, r.id)).length)();
+}
+
 /** Housekeeping: events older than 7 days, request keys older than 48 hours. */
 function prune(db, now = Date.now()) {
   db.prepare(`DELETE FROM r_events WHERE at < ? AND seq < (SELECT MAX(seq) FROM r_events)`).run(new Date(now - 7 * 864e5).toISOString());
@@ -208,5 +242,5 @@ function prune(db, now = Date.now()) {
 
 module.exports = {
   RestaurantError, ensureSchema, applyPulled, PULL_TYPES, settings, activeStationIds, station, menuItem, taxRules,
-  hubStatus, assertHub, isSoldOut, businessDate, nextNumber, emit, eventsAfter, onceForKey, prune, uuid, nowIso,
+  hubStatus, assertHub, isSoldOut, audit, queuePendingAudit, businessDate, nextNumber, emit, eventsAfter, onceForKey, prune, uuid, nowIso,
 };
