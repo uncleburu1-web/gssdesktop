@@ -56,8 +56,8 @@ export default function ReturnModal({ saleId, onClose, onDone }) {
                 {sale.items.map((i) => (
                   <tr key={i.id}>
                     <td>{i.item_name}<div style={{ fontSize: 11, color: 'var(--text-dim)' }}>{money(i.total / i.quantity)} each</div></td>
-                    <td className="num">{i.quantity}{left(i) < i.quantity ? ` (${i.quantity - left(i)} back)` : ''}</td>
-                    <td><input type="number" min="0" max={left(i)} step="1" style={{ width: 70 }} disabled={left(i) <= 0}
+                    <td className="num">{i.quantity}{i.by_weight ? ' kg' : ''}{left(i) < i.quantity ? ` (${Math.round((i.quantity - left(i)) * 1000) / 1000} back)` : ''}</td>
+                    <td><input type="number" min="0" max={left(i)} step={i.by_weight ? '0.001' : '1'} style={{ width: 70 }} disabled={left(i) <= 0}
                       value={qty[i.id] ?? ''} onChange={(e) => setQty({ ...qty, [i.id]: e.target.value })} /></td>
                     <td style={{ textAlign: 'center' }}>
                       <input type="checkbox" title="Damaged: write it off instead of putting it back in stock"

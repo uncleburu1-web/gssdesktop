@@ -93,6 +93,7 @@ function migrate(db) {
   // purpose, so a cloud that understands them (protocol 3) receives the till's shift history once.
   if (!hasColumn('shifts', 'synced_at')) db.exec('ALTER TABLE shifts ADD COLUMN synced_at TEXT');
   if (!hasColumn('sale_items', 'promotion_id')) db.exec('ALTER TABLE sale_items ADD COLUMN promotion_id TEXT');
+  if (!hasColumn('products', 'sold_by_weight')) db.exec('ALTER TABLE products ADD COLUMN sold_by_weight INTEGER NOT NULL DEFAULT 0');
   if (!hasColumn('sales', 'seller')) {
     // Who rang each sale up. Older sales made inside a shift get the shift's cashier; the rest stay
     // unknown (only owners and roles allowed to see every sale see those).
@@ -157,6 +158,9 @@ function setSetting(db, key, value) {
   ).run(key, value == null ? '' : value);
 }
 
+/** Quantities to the gram: 3 decimals, never float dust (0.1 + 0.2). */
+const q3 = (n) => Math.round(Number(n) * 1000) / 1000;
+
 /**
  * Appends one outbox row. Every write to shop data goes through this so
  * the sync engine has something to push later. Deliberately NOT called
@@ -198,15 +202,15 @@ function currentActor(db) {
 // Products
 // ---------------------------------------------------------------------
 
-function createProduct(db, { name, short_code = '', barcode = null, category = 'other', unit = 'PIECE', sell_price = 0, min_stock = 2 }) {
+function createProduct(db, { name, short_code = '', barcode = null, category = 'other', unit = 'PIECE', sell_price = 0, min_stock = 2, sold_by_weight = false }) {
   const id = uuid();
   const ts = nowIso();
   const cleanBarcode = barcode && barcode.trim() ? barcode.trim() : null; // '' -> null, see idx_products_barcode
   try {
     db.prepare(
-      `INSERT INTO products (id, name, short_code, barcode, category, unit, sell_price, min_stock, created_at, updated_at, is_deleted)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
-    ).run(id, name, short_code, cleanBarcode, category, unit, sell_price, min_stock, ts, ts);
+      `INSERT INTO products (id, name, short_code, barcode, category, unit, sell_price, min_stock, sold_by_weight, created_at, updated_at, is_deleted)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+    ).run(id, name, short_code, cleanBarcode, category, sold_by_weight ? 'KG' : unit, sell_price, min_stock, sold_by_weight ? 1 : 0, ts, ts);
   } catch (err) {
     if (cleanBarcode && /UNIQUE constraint failed: products\.barcode/.test(err.message)) {
       throw new Error(`Barcode "${cleanBarcode}" is already used by another product.`);
@@ -228,7 +232,7 @@ function computeStockFields(db, productId) {
   const batches = db.prepare(
     `SELECT * FROM stock_batches WHERE product_id = ? AND is_deleted = 0`
   ).all(productId);
-  const quantity = batches.reduce((sum, b) => sum + b.quantity_remaining, 0);
+  const quantity = q3(batches.reduce((sum, b) => sum + b.quantity_remaining, 0));
   const remainingWithStock = batches.filter((b) => b.quantity_remaining > 0);
   const totalQty = remainingWithStock.reduce((s, b) => s + b.quantity_remaining, 0);
   const costPrice = totalQty
@@ -259,7 +263,7 @@ function stockFieldsForAllProducts(db) {
     const acc = byProduct.get(productId);
     if (!acc) return { quantity: 0, cost_price: 0 };
     const costPrice = acc.totalQty ? acc.weightedCost / acc.totalQty : 0;
-    return { quantity: acc.quantity, cost_price: Math.round(costPrice * 100) / 100 };
+    return { quantity: q3(acc.quantity), cost_price: Math.round(costPrice * 100) / 100 };
   };
 }
 
@@ -319,6 +323,8 @@ function listCustomers(db, { search = '' } = {}) {
 }
 
 function addStockBatch(db, { product_id, batch_number = '', quantity_received, cost_price = 0, expiry_date = null }) {
+  quantity_received = checkQuantity(productById(db, product_id), quantity_received, 'Quantity received');
+  if (quantity_received <= 0) throw new Error('Quantity received must be more than zero.');
   const id = uuid();
   const ts = nowIso();
   db.prepare(
@@ -353,14 +359,15 @@ function allocateStock(db, saleItemId, productId, quantity) {
   let totalTaken = 0;
   for (const batch of batches) {
     if (remaining <= 0) break;
-    const take = Math.min(batch.quantity_remaining, remaining);
-    db.prepare(`UPDATE stock_batches SET quantity_remaining = quantity_remaining - ?, updated_at = ? WHERE id = ?`)
+    const take = q3(Math.min(batch.quantity_remaining, remaining));
+    if (take <= 0) continue;
+    db.prepare(`UPDATE stock_batches SET quantity_remaining = ROUND(quantity_remaining - ?, 3), updated_at = ? WHERE id = ?`)
       .run(take, nowIso(), batch.id);
     db.prepare(`INSERT INTO sale_allocations (id, sale_item_id, batch_id, quantity) VALUES (?, ?, ?, ?)`)
       .run(uuid(), saleItemId, batch.id, take);
     totalCost += take * batch.cost_price;
-    totalTaken += take;
-    remaining -= take;
+    totalTaken = q3(totalTaken + take);
+    remaining = q3(remaining - take);
   }
   return { unitCost: totalTaken ? Math.round((totalCost / totalTaken) * 100) / 100 : 0, shortfall: remaining };
 }
@@ -369,7 +376,7 @@ function restoreStock(db, saleItemId) {
   const allocations = db.prepare(`SELECT * FROM sale_allocations WHERE sale_item_id = ?`).all(saleItemId);
   for (const alloc of allocations) {
     if (alloc.batch_id) {
-      db.prepare(`UPDATE stock_batches SET quantity_remaining = quantity_remaining + ?, updated_at = ? WHERE id = ?`)
+      db.prepare(`UPDATE stock_batches SET quantity_remaining = ROUND(quantity_remaining + ?, 3), updated_at = ? WHERE id = ?`)
         .run(alloc.quantity, nowIso(), alloc.batch_id);
     }
   }
@@ -417,6 +424,9 @@ function applyPulledProduct(db, entityId, operation, payload) {
     return;
   }
   const existing = db.prepare(`SELECT updated_at FROM products WHERE id = ?`).get(entityId);
+  const applyWeightFlag = () => {
+    if ('sold_by_weight' in payload) db.prepare(`UPDATE products SET sold_by_weight = ? WHERE id = ?`).run(payload.sold_by_weight ? 1 : 0, entityId);
+  };
   if (existing && hasPendingLocalChange(db, 'product', entityId)) return; // unpushed local edit — keep it, its push updates the cloud
   const fields = [payload.name, payload.short_code || '', payload.barcode || null, payload.category || 'other',
     payload.unit || 'PIECE', payload.sell_price || 0, payload.min_stock ?? 2];
@@ -430,6 +440,7 @@ function applyPulledProduct(db, entityId, operation, payload) {
        VALUES (?,?,?,?,?,?,?,?,?,?,0,?)`
     ).run(entityId, ...fields, ts, ts, ts);
   }
+  applyWeightFlag();
 }
 
 function applyPulledStockBatch(db, entityId, operation, payload) {
@@ -452,8 +463,8 @@ function applyPulledStockBatch(db, entityId, operation, payload) {
   //     deduct from it exactly once.
   const received = payload.quantity_received || 0;
   if (existing) {
-    const delta = received - existing.quantity_received;
-    const remaining = Math.max(0, existing.quantity_remaining + delta);
+    const delta = q3(received - existing.quantity_received);
+    const remaining = Math.max(0, q3(existing.quantity_remaining + delta));
     db.prepare(
       `UPDATE stock_batches SET product_id=?, batch_number=?, quantity_received=?, quantity_remaining=?, cost_price=?, expiry_date=?, updated_at=?, synced_at=? WHERE id=?`
     ).run(payload.product_id, payload.batch_number || '', received, remaining, payload.cost_price || 0, payload.expiry_date || null, ts, ts, entityId);
@@ -642,7 +653,10 @@ function buildSale(sale, items, payments = []) {
 function getSale(db, saleId) {
   const sale = db.prepare(`SELECT * FROM sales WHERE id = ?`).get(saleId);
   if (!sale) return null;
-  const items = db.prepare(`SELECT * FROM sale_items WHERE sale_id = ? AND is_deleted = 0 ORDER BY rowid`).all(saleId);
+  const items = db.prepare(
+    `SELECT si.*, COALESCE(p.sold_by_weight, 0) AS by_weight FROM sale_items si LEFT JOIN products p ON p.id = si.product_id
+      WHERE si.sale_id = ? AND si.is_deleted = 0 ORDER BY si.rowid`
+  ).all(saleId);
   const payments = db.prepare(`SELECT * FROM sale_payments WHERE sale_id = ? AND is_deleted = 0 ORDER BY rowid`).all(saleId);
   const built = buildSale(sale, items, payments);
   built.returns = db.prepare(`SELECT * FROM sale_returns WHERE sale_id = ? ORDER BY created_at`).all(saleId);
@@ -709,6 +723,8 @@ const createSale = (db) => db.transaction((input) => {
   ).run(saleId, invoiceNumber, receiptNo, shift ? shift.id : null, input.customer_id || null, input.customer_name || 'Walk-in', input.staff_name || '', input.cart_owner || null, input.payment_method || 'cash', status, 0, ts, ts, ts);
 
   for (const item of input.items) {
+    item.quantity = checkQuantity(productById(db, item.product_id), item.quantity ?? 1);
+    if (item.quantity <= 0) throw new Error('Every line needs a quantity above zero.');
     const itemId = uuid();
     db.prepare(
       `INSERT INTO sale_items (id, sale_id, product_id, item_name, category, quantity, unit_price, unit_cost, discount, promotion_id, created_at, updated_at, is_deleted)
@@ -1398,12 +1414,27 @@ function getDayReport(db, { date, seller = null } = {}) {
 // The till applies the change to its own batches immediately (it must work offline) and queues
 // ONE 'stock_movement' document for the cloud, which applies the same rule to its own stock.
 // ---------------------------------------------------------------------------------------------
-function wholeQuantity(value, label) {
+
+/**
+ * The one quantity rule (same as the cloud's inventory.ledger.check_quantity): a product sold by
+ * weight takes kg to the gram; every other product, and a line with no product, whole units only.
+ */
+function checkQuantity(product, value, label = 'Quantity') {
   const n = Number(value);
   if (!Number.isFinite(n)) throw new Error(`${label} must be a number.`);
+  if (product && product.sold_by_weight) {
+    if (Math.abs(n * 1000 - Math.round(n * 1000)) > 1e-6) throw new Error(`${label} can have at most 3 decimals (grams).`);
+    return q3(n);
+  }
   if (!Number.isInteger(n)) throw new Error(`${label} must be a whole number for this product.`);
   return n;
 }
+
+function wholeQuantity(value, label, product = null) {
+  return checkQuantity(product, value, label);
+}
+
+const productById = (db, id) => (id ? db.prepare(`SELECT * FROM products WHERE id = ?`).get(id) : null);
 
 function liveBatchesFefo(db, productId) {
   return db.prepare(
@@ -1424,10 +1455,10 @@ function takeFefo(db, productId, quantity, meta) {
   for (const batch of liveBatchesFefo(db, productId)) {
     if (remaining <= 0) break;
     if (batch.quantity_remaining <= 0) continue;
-    const take = Math.min(batch.quantity_remaining, remaining);
-    db.prepare(`UPDATE stock_batches SET quantity_remaining = quantity_remaining - ?, updated_at = ? WHERE id = ?`).run(take, meta.at, batch.id);
+    const take = q3(Math.min(batch.quantity_remaining, remaining));
+    db.prepare(`UPDATE stock_batches SET quantity_remaining = ROUND(quantity_remaining - ?, 3), updated_at = ? WHERE id = ?`).run(take, meta.at, batch.id);
     insertLocalMovement(db, { ...meta, productId, batchId: batch.id, quantity: -take });
-    remaining -= take;
+    remaining = q3(remaining - take);
   }
 }
 
@@ -1438,11 +1469,11 @@ function enqueueStockDoc(db, doc) {
 function recordDamage(db, { product_id, quantity, reason } = {}) {
   const why = String(reason || '').trim();
   if (!why) throw new Error('Say why the stock is damaged — a reason is required.');
-  const qty = wholeQuantity(quantity, 'Quantity');
-  if (qty <= 0) throw new Error('Quantity must be more than zero.');
   return db.transaction(() => {
-    const product = db.prepare(`SELECT id, name FROM products WHERE id = ? AND is_deleted = 0`).get(product_id);
+    const product = db.prepare(`SELECT id, name, sold_by_weight FROM products WHERE id = ? AND is_deleted = 0`).get(product_id);
     if (!product) throw new Error('Product not found.');
+    const qty = checkQuantity(product, quantity, 'Quantity');
+    if (qty <= 0) throw new Error('Quantity must be more than zero.');
     const available = liveBatchesFefo(db, product_id).reduce((s, b) => s + b.quantity_remaining, 0);
     if (qty > available) throw new Error(`Only ${available} of ${product.name} in stock — cannot write off ${qty}.`);
     const doc = { id: uuid(), kind: 'damage', product_id, quantity: qty, system_quantity: null, counted_quantity: null,
@@ -1459,11 +1490,11 @@ function recordDamage(db, { product_id, quantity, reason } = {}) {
 function recordStockCount(db, { product_id, counted_quantity, reason } = {}) {
   const why = String(reason || '').trim();
   if (!why) throw new Error('Say why the count differs — a reason is required.');
-  const counted = wholeQuantity(counted_quantity, 'Counted quantity');
-  if (counted < 0) throw new Error('Counted quantity cannot be negative.');
   return db.transaction(() => {
-    const product = db.prepare(`SELECT id FROM products WHERE id = ? AND is_deleted = 0`).get(product_id);
+    const product = db.prepare(`SELECT id, sold_by_weight FROM products WHERE id = ? AND is_deleted = 0`).get(product_id);
     if (!product) throw new Error('Product not found.');
+    const counted = checkQuantity(product, counted_quantity, 'Counted quantity');
+    if (counted < 0) throw new Error('Counted quantity cannot be negative.');
     const batches = liveBatchesFefo(db, product_id);
     const system = batches.reduce((s, b) => s + b.quantity_remaining, 0);
     const diff = counted - system;
@@ -1490,7 +1521,7 @@ function recordStockCount(db, { product_id, counted_quantity, reason } = {}) {
         ).run(id, product_id, at, at, at, at);
         target = { id };
       }
-      db.prepare(`UPDATE stock_batches SET quantity_remaining = quantity_remaining + ?, updated_at = ? WHERE id = ?`).run(diff, at, target.id);
+      db.prepare(`UPDATE stock_batches SET quantity_remaining = ROUND(quantity_remaining + ?, 3), updated_at = ? WHERE id = ?`).run(diff, at, target.id);
       insertLocalMovement(db, { ...meta, productId: product_id, batchId: target.id, quantity: diff });
     }
     enqueueStockDoc(db, doc);
@@ -1523,7 +1554,7 @@ function applyPulledStockMovement(db, entityId, operation, payload) {
   const quantity = Number(payload.quantity) || 0;
   const batch = payload.batch_id ? db.prepare(`SELECT id, quantity_remaining FROM stock_batches WHERE id = ?`).get(payload.batch_id) : null;
   if (batch && quantity !== 0) {
-    const next = Math.max(0, batch.quantity_remaining + quantity);
+    const next = Math.max(0, q3(batch.quantity_remaining + quantity));
     db.prepare(`UPDATE stock_batches SET quantity_remaining = ?, updated_at = ? WHERE id = ?`).run(next, nowIso(), batch.id);
   }
   db.prepare(
@@ -1584,8 +1615,8 @@ function createReturn(db, { sale_id, lines, refund_method = 'cash', refund_amoun
     for (const line of lines) {
       const item = items.get(line.sale_item_id);
       if (!item) throw new Error('A returned item is not on this sale.');
-      const qty = Number(line.quantity);
-      if (!Number.isInteger(qty) || qty <= 0) throw new Error('Return whole units, at least one.');
+      const qty = checkQuantity(productById(db, item.product_id), line.quantity, 'Quantity returned');
+      if (qty <= 0) throw new Error('Return at least some of an item.');
       perItem.set(item.id, (perItem.get(item.id) || 0) + qty);
       wanted.push({ item, qty, restock: line.restock !== false });
     }
@@ -1613,19 +1644,19 @@ function createReturn(db, { sale_id, lines, refund_method = 'cash', refund_amoun
       let remaining = w.qty;
       for (const alloc of db.prepare(`SELECT * FROM sale_allocations WHERE sale_item_id = ? ORDER BY rowid DESC`).all(w.item.id)) {
         if (remaining <= 0) break;
-        const take = Math.min(alloc.quantity, remaining);
+        const take = q3(Math.min(alloc.quantity, remaining));
         if (w.restock && alloc.batch_id) {
-          db.prepare(`UPDATE stock_batches SET quantity_remaining = quantity_remaining + ?, updated_at = ? WHERE id = ?`).run(take, at, alloc.batch_id);
+          db.prepare(`UPDATE stock_batches SET quantity_remaining = ROUND(quantity_remaining + ?, 3), updated_at = ? WHERE id = ?`).run(take, at, alloc.batch_id);
           insertLocalMovement(db, { docId: id, productId: w.item.product_id, batchId: alloc.batch_id, kind: 'return', quantity: take, reason: why, actor, at });
         }
         if (take === alloc.quantity) db.prepare(`DELETE FROM sale_allocations WHERE id = ?`).run(alloc.id);
         else db.prepare(`UPDATE sale_allocations SET quantity = quantity - ? WHERE id = ?`).run(take, alloc.id);
-        remaining -= take;
+        remaining = q3(remaining - take);
       }
       if (w.restock && remaining > 0 && w.item.product_id) {
         const batch = db.prepare(`SELECT id FROM stock_batches WHERE product_id = ? AND is_deleted = 0 ORDER BY received_date DESC LIMIT 1`).get(w.item.product_id);
         if (batch) {
-          db.prepare(`UPDATE stock_batches SET quantity_remaining = quantity_remaining + ?, updated_at = ? WHERE id = ?`).run(remaining, at, batch.id);
+          db.prepare(`UPDATE stock_batches SET quantity_remaining = ROUND(quantity_remaining + ?, 3), updated_at = ? WHERE id = ?`).run(remaining, at, batch.id);
           insertLocalMovement(db, { docId: id, productId: w.item.product_id, batchId: batch.id, kind: 'return', quantity: remaining, reason: why, actor, at });
         }
       }

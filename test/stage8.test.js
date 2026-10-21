@@ -43,7 +43,7 @@ test('reason, whole units and a refund within the value are required', () => wit
   const { sale, line } = setup(db);
   const go = (extra) => () => dbm.createReturn(db, { sale_id: sale.id, lines: [{ sale_item_id: line.id, quantity: 1 }], reason: 'ok', ...extra }, 'boss');
   assert.throws(go({ reason: ' ' }), /reason/);
-  assert.throws(go({ lines: [{ sale_item_id: line.id, quantity: 1.5 }] }), /whole units/);
+  assert.throws(go({ lines: [{ sale_item_id: line.id, quantity: 1.5 }] }), /whole number/);
   assert.throws(go({ refund_amount: 2000 }), /at most 900/);
   assert.equal(queued(db, 'sale_return').length, 0);
 }));
