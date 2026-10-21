@@ -372,6 +372,28 @@ function allocateStock(db, saleItemId, productId, quantity) {
   return { unitCost: totalTaken ? Math.round((totalCost / totalTaken) * 100) / 100 : 0, shortfall: remaining };
 }
 
+/**
+ * Take a sale made ELSEWHERE (pulled from the cloud) off this till's stock: exactly the quantity the
+ * cloud itself took, in full. Whatever the batches here cannot cover yet goes onto the newest batch
+ * as a (temporary) negative, because the change that makes it add up (a count, a return, a delivery)
+ * may simply not have arrived yet. Clamping at zero instead silently dropped part of the sale, and a
+ * fresh till ended up with more stock than the cloud (found in the v1.0.22 release check).
+ * Returns what could not be placed at all (only when the product has no batch here).
+ */
+function deductPulledSale(db, saleItemId, productId, quantity) {
+  const { shortfall } = allocateStock(db, saleItemId, productId, quantity);
+  if (!(shortfall > 0)) return 0;
+  const newest = db.prepare(
+    `SELECT id FROM stock_batches WHERE product_id = ? AND is_deleted = 0 ORDER BY received_date DESC, created_at DESC LIMIT 1`
+  ).get(productId);
+  if (!newest) return shortfall;
+  db.prepare(`UPDATE stock_batches SET quantity_remaining = ROUND(quantity_remaining - ?, 3), updated_at = ? WHERE id = ?`)
+    .run(shortfall, nowIso(), newest.id);
+  db.prepare(`INSERT INTO sale_allocations (id, sale_item_id, batch_id, quantity) VALUES (?, ?, ?, ?)`)
+    .run(uuid(), saleItemId, newest.id, shortfall);
+  return 0;
+}
+
 function restoreStock(db, saleItemId) {
   const allocations = db.prepare(`SELECT * FROM sale_allocations WHERE sale_item_id = ?`).all(saleItemId);
   for (const alloc of allocations) {
@@ -464,7 +486,7 @@ function applyPulledStockBatch(db, entityId, operation, payload) {
   const received = payload.quantity_received || 0;
   if (existing) {
     const delta = q3(received - existing.quantity_received);
-    const remaining = Math.max(0, q3(existing.quantity_remaining + delta));
+    const remaining = q3(existing.quantity_remaining + delta); // never clamped: see applyPulledStockMovement
     db.prepare(
       `UPDATE stock_batches SET product_id=?, batch_number=?, quantity_received=?, quantity_remaining=?, cost_price=?, expiry_date=?, updated_at=?, synced_at=? WHERE id=?`
     ).run(payload.product_id, payload.batch_number || '', received, remaining, payload.cost_price || 0, payload.expiry_date || null, ts, ts, entityId);
@@ -602,15 +624,16 @@ function applyPulledSaleItem(db, entityId, operation, payload) {
 
   // The one case pulling a sale item actually changes something besides
   // the sales tables: deduct THIS desktop's own local stock so it stays
-  // accurate for a sale that happened somewhere else entirely. This can
-  // ALSO come up short (this till's own locally-known stock wasn't
-  // enough either) — if so, that's a SEPARATE local shortfall on top of
-  // whatever the cloud already recorded above, so add rather than
-  // overwrite it.
+  // accurate for a sale that happened somewhere else entirely. Deduct what
+  // the CLOUD took (the quantity minus the cloud's own shortfall), in full,
+  // so the result does not depend on the order the history arrives in.
   if (payload.product_id) {
-    const { shortfall } = allocateStock(db, entityId, payload.product_id, payload.quantity || 1);
-    if (shortfall > 0) {
-      db.prepare(`UPDATE sale_items SET stock_shortfall = stock_shortfall + ? WHERE id = ?`).run(shortfall, entityId);
+    const quantity = Number(payload.quantity) || 1;
+    const cloudShortfall = Math.min(quantity, Math.max(0, Number(payload.stock_shortfall) || 0));
+    const taken = q3(quantity - cloudShortfall);
+    const unplaced = taken > 0 ? deductPulledSale(db, entityId, payload.product_id, taken) : 0;
+    if (unplaced > 0) {
+      db.prepare(`UPDATE sale_items SET stock_shortfall = stock_shortfall + ? WHERE id = ?`).run(unplaced, entityId);
     }
   }
 }
@@ -1554,7 +1577,9 @@ function applyPulledStockMovement(db, entityId, operation, payload) {
   const quantity = Number(payload.quantity) || 0;
   const batch = payload.batch_id ? db.prepare(`SELECT id, quantity_remaining FROM stock_batches WHERE id = ?`).get(payload.batch_id) : null;
   if (batch && quantity !== 0) {
-    const next = Math.max(0, q3(batch.quantity_remaining + quantity));
+    // Exactly the cloud's change, never clamped at zero: the history can arrive in a different order
+    // from how it happened, and a clamp here lost stock changes for good.
+    const next = q3(batch.quantity_remaining + quantity);
     db.prepare(`UPDATE stock_batches SET quantity_remaining = ?, updated_at = ? WHERE id = ?`).run(next, nowIso(), batch.id);
   }
   db.prepare(
