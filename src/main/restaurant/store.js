@@ -23,6 +23,9 @@ class RestaurantError extends Error {
 
 function ensureSchema(db) {
   db.exec(fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8'));
+  // Columns added after a table first existed (development builds only; nothing restaurant has shipped).
+  const has = (table, column) => db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
+  if (!has('r_orders', 'pricing')) db.exec(`ALTER TABLE r_orders ADD COLUMN pricing TEXT NOT NULL DEFAULT '{}'`);
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -292,6 +292,33 @@ test('cancelling: reason, manager once sent, never with payments, kitchen told, 
   } finally { cleanup(); }
 });
 
+test('service charge and taxes are frozen when the order opens: a change in the cloud during service applies to the next orders only', () => {
+  const { db, cleanup } = hub();
+  try {
+    const before = engine.openOrder(db, { service_type: 'dine_in', table_id: ID.t1 }, owner);
+    engine.addItems(db, before.id, [{ menu_item_id: ID.chapman, quantity: 2 }], owner);
+    const printed = engine.printBill(db, before.id, owner).bill;
+    assert.equal(printed.total, '3525.00', '3,000 + service 300 + VAT 225');
+
+    // Mid-service the owner changes the service charge and switches VAT off; the hub pulls it.
+    dbm.applyPulledOperation(db, 'restaurant_settings', 'update', { id: 's1', service_charge_rate: '12.5', service_charge_types: ['dine_in'], business_day_starts_at: '05:00', order_number_prefix: 'K-' });
+    dbm.applyPulledOperation(db, 'tax_rule', 'update', { id: ID.vat, name: 'VAT', rate: '7.5', inclusive: false, tax_classes: [], applies_to_service_charge: false, valid_from: '2026-01-01', valid_to: null, is_active: false });
+
+    engine.addItems(db, before.id, [{ menu_item_id: ID.chapman }], owner); // even adding items re-works the bill with the frozen rates
+    const after = engine.printBill(db, before.id, owner).bill;
+    assert.equal(after.total, '5287.50', '4,500 + service 450 (10%) + VAT 337.50: the rates the order opened with');
+    assert.deepEqual(after.charges.map((c) => [c.name, c.rate]), [['Service charge', '10.0000'], ['VAT', '7.5000']]);
+
+    const next = engine.openOrder(db, { service_type: 'dine_in', table_id: ID.t2 }, owner);
+    engine.addItems(db, next.id, [{ menu_item_id: ID.chapman, quantity: 2 }], owner);
+    assert.equal(engine.printBill(db, next.id, owner).bill.total, '3375.00', 'a new order: service 12.5%, no VAT');
+
+    const doc = engine.orderDoc(db, before.id);
+    assert.equal(doc.pricing.service_charge.rate, '10');
+    assert.deepEqual(doc.pricing.tax_rules.map((r) => [r.id, r.rate, r.is_active]), [[ID.vat, '7.5', true]], 'the upload carries what the bill was worked out with');
+  } finally { cleanup(); }
+});
+
 test('an older cloud cannot take orders yet: they wait on the hub and go up once it upgrades', () => {
   const { db, cleanup } = hub({ protocol: 5 });
   try {

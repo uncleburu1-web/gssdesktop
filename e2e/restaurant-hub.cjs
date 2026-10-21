@@ -81,7 +81,7 @@ const list = (d) => (Array.isArray(d) ? d : d.results);
   await post('menu/item-modifier-groups/', { menu_item: jollof.id, group: size.id });
   const hall = await post('areas/', { name: 'Hall' });
   const t1 = await post('tables/', { area: hall.id, label: 'T1', seats: 4 });
-  await post('tables/', { area: hall.id, label: 'T2', seats: 2 });
+  const t2 = await post('tables/', { area: hall.id, label: 'T2', seats: 2 });
   const vat = await post('tax-rules/', { name: 'VAT', rate: '7.5', valid_from: '2026-01-01' });
   await post('tax-rules/activate/', { rule_ids: [vat.id], state: 'Lagos', vat_registered: true, treatment_confirmed: true });
   await api(ceo, 'PUT', '/restaurant/settings/', { service_charge_rate: '10', service_charge_types: ['dine_in'] }, store);
@@ -164,6 +164,16 @@ const list = (d) => (Array.isArray(d) ? d : d.results);
   engine.addItems(db, third.id, [{ menu_item_id: chapman.id }], owner);
   check(engine.orderView(db, second.id).items[0].unit_price === '1500.00' && engine.orderView(db, third.id).items[0].unit_price === '2000.00',
     'the open order keeps its price; a new order gets the new one');
+  // The same for the service charge: changed in the cloud while a table is still eating.
+  const eating = engine.openOrder(db, { service_type: 'dine_in', table_id: t2.id }, owner);
+  engine.addItems(db, eating.id, [{ menu_item_id: chapman.id }], owner);
+  await api(ceo, 'PUT', '/restaurant/settings/', { service_charge_rate: '15' }, store);
+  await settle();
+  const late = engine.openOrder(db, { service_type: 'dine_in', table_id: t1.id }, owner);
+  engine.addItems(db, late.id, [{ menu_item_id: chapman.id }], owner);
+  const rateOf = (o) => engine.printBill(db, o.id, owner).bill.charges.find((c) => c.kind === 'service_charge').rate;
+  check(rateOf(eating) === '10.0000' && rateOf(late) === '15.0000', 'a service charge changed mid-service: the open table keeps 10%, the next one gets 15%',
+    `${rateOf(eating)} / ${rateOf(late)}`);
 
   // ---- 5b. Audited actions while online with today's cloud (protocol 5) -----------------------
   // The cloud accepts only a few till audit actions before protocol 6; restaurant ones must wait on

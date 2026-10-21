@@ -47,7 +47,10 @@ CREATE TABLE IF NOT EXISTS r_orders (
   id TEXT PRIMARY KEY, number TEXT NOT NULL, service_type TEXT NOT NULL, table_id TEXT, guests INTEGER,
   waiter TEXT, opened_by TEXT, status TEXT NOT NULL DEFAULT 'open',          -- open | closed | cancelled
   business_date TEXT NOT NULL, opened_at TEXT NOT NULL, closed_at TEXT, cancel_reason TEXT, notes TEXT NOT NULL DEFAULT '',
-  device_id TEXT, queued_at TEXT                                              -- when its order_doc entered the outbox
+  device_id TEXT, queued_at TEXT,                                             -- when its order_doc entered the outbox
+  -- The service charge and tax rules as they were when the order was opened. Every bill for this
+  -- order is worked out from this copy, so a change in the cloud during service never alters it.
+  pricing TEXT NOT NULL DEFAULT '{}'
 );
 -- One open dine-in order per table (R5), enforced by the database itself.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_r_orders_one_open_per_table ON r_orders(table_id) WHERE status = 'open' AND table_id IS NOT NULL;
