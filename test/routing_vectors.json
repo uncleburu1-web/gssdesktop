@@ -1,0 +1,61 @@
+{
+  "station_for": [
+    {"name": "item station wins", "item": "grill", "category": "kitchen", "active": ["grill", "kitchen"], "expect": "grill"},
+    {"name": "category station when the item has none", "item": null, "category": "kitchen", "active": ["kitchen"], "expect": "kitchen"},
+    {"name": "inactive item station falls back to the category", "item": "grill", "category": "kitchen", "active": ["kitchen"], "expect": "kitchen"},
+    {"name": "no active station anywhere", "item": "grill", "category": "kitchen", "active": [], "expect": null},
+    {"name": "nothing set (e.g. bottled water)", "item": null, "category": null, "active": ["kitchen"], "expect": null}
+  ],
+  "route": [
+    {
+      "name": "pizza, fries, soft drink: kitchen and bar tickets (owner's example)",
+      "lines": [
+        {"id": "pizza", "station_id": "kitchen"},
+        {"id": "fries", "station_id": "kitchen"},
+        {"id": "drink", "station_id": "bar"}
+      ],
+      "expect": {"tickets": [{"station_id": "kitchen", "items": ["pizza", "fries"]}, {"station_id": "bar", "items": ["drink"]}], "unrouted": [], "skipped": []}
+    },
+    {
+      "name": "tickets follow the order stations first appear; items keep line order",
+      "lines": [
+        {"id": "a", "station_id": "bar"},
+        {"id": "b", "station_id": "grill"},
+        {"id": "c", "station_id": "bar"},
+        {"id": "d", "station_id": "kitchen"},
+        {"id": "e", "station_id": "grill"}
+      ],
+      "expect": {"tickets": [{"station_id": "bar", "items": ["a", "c"]}, {"station_id": "grill", "items": ["b", "e"]}, {"station_id": "kitchen", "items": ["d"]}], "unrouted": [], "skipped": []}
+    },
+    {
+      "name": "a retried send never routes lines already sent (no duplicate tickets)",
+      "lines": [
+        {"id": "jollof", "station_id": "kitchen", "state": "sent"},
+        {"id": "suya", "station_id": "grill", "state": "sent"},
+        {"id": "extra-jollof", "station_id": "kitchen", "state": "pending"}
+      ],
+      "expect": {"tickets": [{"station_id": "kitchen", "items": ["extra-jollof"]}], "unrouted": [], "skipped": ["jollof", "suya"]}
+    },
+    {
+      "name": "everything already sent: nothing to print",
+      "lines": [
+        {"id": "x", "station_id": "kitchen", "state": "sent"},
+        {"id": "y", "station_id": "bar", "state": "voided"}
+      ],
+      "expect": {"tickets": [], "unrouted": [], "skipped": ["x", "y"]}
+    },
+    {
+      "name": "lines without a station are reported, not dropped",
+      "lines": [
+        {"id": "water", "station_id": null},
+        {"id": "rice", "station_id": "kitchen"}
+      ],
+      "expect": {"tickets": [{"station_id": "kitchen", "items": ["rice"]}], "unrouted": ["water"], "skipped": []}
+    },
+    {
+      "name": "empty order",
+      "lines": [],
+      "expect": {"tickets": [], "unrouted": [], "skipped": []}
+    }
+  ]
+}
