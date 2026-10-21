@@ -13,7 +13,7 @@ const store = require('../src/main/restaurant/store');
 
 const { hub, ID, owner, waiter, cashier, kitchenScreen } = require('./restaurant.helpers');
 
-const queued = (db, type) => db.prepare(`SELECT * FROM sync_queue WHERE entity_type = ?`).all(type);
+const queued = (db, type) => db.prepare(`SELECT * FROM sync_queue WHERE entity_type = ? ORDER BY rowid`).all(type); // queue order, not random-id order
 const events = (db, type) => db.prepare(`SELECT * FROM r_events WHERE type = ?`).all(type);
 const largeJollof = (n = 1, extra = []) => ({ menu_item_id: ID.jollof, quantity: n, modifiers: [ID.large, ...extra] });
 
@@ -327,7 +327,8 @@ test('an older cloud is never sent restaurant audit entries it would refuse; the
 
     dbm.setSetting(db, 'cloud_sync_protocol', '6');
     assert.equal(engine.reconcileOrders(db), 3, 'the open order stays; the three audit entries go up');
-    const up = queued(db, 'audit_event').map((q) => JSON.parse(q.payload));
+    // In the order they were queued (the queue's own index would order them by random id).
+    const up = db.prepare(`SELECT payload FROM sync_queue WHERE entity_type = 'audit_event' ORDER BY client_timestamp, rowid`).all().map((q) => JSON.parse(q.payload));
     assert.deepEqual(up.map((p) => [p.action, p.actor]), kept.map((r) => [r.action, r.actor]));
     assert.equal(engine.reconcileOrders(db), 0, 'never twice');
     engine.moveTable(db, o.id, ID.t1, owner);
