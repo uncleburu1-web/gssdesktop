@@ -1,4 +1,5 @@
 const Database = require('better-sqlite3');
+const restaurantStore = require('./restaurant/store');
 const { getOrCreateDeviceId } = require('./device');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -29,6 +30,7 @@ function openDb(dbPath) {
   const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
   db.exec(schema);
   migrate(db);
+  restaurantStore.ensureSchema(db); // restaurant tables (empty on supermarket tills)
   return db;
 }
 
@@ -651,6 +653,7 @@ const PULL_HANDLERS = {
 function applyPulledOperation(db, entityType, operation, payload) {
   const handler = PULL_HANDLERS[entityType];
   if (handler) handler(db, payload.id, operation, payload);
+  else restaurantStore.applyPulled(db, entityType, operation, payload); // restaurant configuration (opt-in pull)
 }
 
 function computeItemTotals(item) {
@@ -1023,6 +1026,25 @@ function computeShiftReport(db, shift) {
      WHERE p.shift_id = ? AND p.is_deleted = 0 AND s.is_deleted = 0 GROUP BY p.method`
   ).all(shift.id)) byMethod[row.method] = money2(row.amount);
 
+  // Restaurant payments taken in this shift (restaurant/engine.js) count toward the same drawer.
+  // Cash tips are physically in the drawer, so they are expected there, but shown apart from takings.
+  // A supermarket till has none of these rows, so its report is exactly as before.
+  const restaurantRows = db.prepare(
+    `SELECT method, SUM(amount) AS amount, SUM(tip) AS tip, COUNT(*) AS n FROM r_payments WHERE shift_id = ? GROUP BY method`
+  ).all(shift.id);
+  let restaurant = null;
+  let cashTips = 0;
+  if (restaurantRows.length) {
+    restaurant = { payments: 0, takings: 0, tips: 0 };
+    for (const row of restaurantRows) {
+      byMethod[row.method] = money2((byMethod[row.method] || 0) + Number(row.amount));
+      restaurant.payments += row.n;
+      restaurant.takings = money2(restaurant.takings + Number(row.amount));
+      restaurant.tips = money2(restaurant.tips + Number(row.tip));
+      if (row.method === 'cash') cashTips = money2(Number(row.tip));
+    }
+  }
+
   const movement = (kind) => money2(db.prepare(`SELECT COALESCE(SUM(amount), 0) AS n FROM cash_movements WHERE shift_id = ? AND kind = ?`).get(shift.id, kind).n);
   const paidIn = movement('paid_in');
   const paidOut = movement('paid_out');
@@ -1049,10 +1071,12 @@ function computeShiftReport(db, shift) {
       paid_in: paidIn,
       paid_out: paidOut,
       refunds: cashRefunds,
-      expected: money2(shift.opening_float + byMethod.cash + paidIn - paidOut - cashRefunds),
+      expected: money2(shift.opening_float + byMethod.cash + cashTips + paidIn - paidOut - cashRefunds),
       counted: null,
       variance: null,
+      ...(cashTips ? { tips: cashTips } : {}),
     },
+    ...(restaurant ? { restaurant } : {}),
     voided: { count: voided.n, paid: money2(voided.paid) },
     refunds: { count: refundCount, total: money2(Object.values(refundsByMethod).reduce((t, v) => t + v, 0)), by_method: refundsByMethod },
     outstanding: { count: owing.length, balance: money2(owing.reduce((sum, s) => sum + s.balance_due, 0)) },
