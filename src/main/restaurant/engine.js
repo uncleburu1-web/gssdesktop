@@ -63,15 +63,34 @@ function tx(db, key, op, request, fn) {
 // ---------------------------------------------------------------------------------------------
 // The bill (used by T6, T8, T9, T10)
 // ---------------------------------------------------------------------------------------------
-function computeFor(db, order, { discountSpec } = {}) {
+/**
+ * What the order's bills are worked out with: the service charge and the tax rules in force when the
+ * order was opened (copied onto the order, like item prices). A rate changed or a tax switched on in
+ * the cloud during service applies to the NEXT orders, never to this one.
+ */
+function pricingNow(db, businessDate) {
   const s = store.settings(db);
+  return {
+    service_charge: { rate: s.service_charge_rate, service_types: s.service_charge_types },
+    tax_rules: store.taxRules(db).filter((r) => r.is_active && r.valid_from <= businessDate && (!r.valid_to || r.valid_to >= businessDate)),
+  };
+}
+
+function pricingOf(db, order) {
+  let p = {};
+  try { p = JSON.parse(order.pricing || '{}'); } catch { p = {}; }
+  return p.service_charge && Array.isArray(p.tax_rules) ? p : pricingNow(db, order.business_date);
+}
+
+function computeFor(db, order, { discountSpec } = {}) {
+  const pricing = pricingOf(db, order);
   const lines = items(db, order.id).map((i) => ({ id: i.id, unit_price: i.unit_price, modifiers_price: i.modifiers_price,
     quantity: String(i.quantity), voided_quantity: String(i.voided_quantity), tax_class: i.tax_class }));
   const existing = billOf(db, order.id);
   const spec = discountSpec !== undefined ? discountSpec : (existing && existing.discount_spec ? JSON.parse(existing.discount_spec) : null);
   return billing.computeBill({
     service_type: order.service_type, business_date: order.business_date, lines, discount: spec,
-    service_charge: { rate: s.service_charge_rate, service_types: s.service_charge_types }, tax_rules: store.taxRules(db),
+    service_charge: pricing.service_charge, tax_rules: pricing.tax_rules,
   });
 }
 
@@ -187,9 +206,10 @@ function openOrder(db, { service_type: serviceType, table_id: tableId = null, gu
     const number = `${prefix}${String(store.nextNumber(db, 'order', day)).padStart(4, '0')}`;
     const id = uuid();
     try {
-      db.prepare(`INSERT INTO r_orders (id, number, service_type, table_id, guests, waiter, opened_by, status, business_date, opened_at, notes, device_id)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)`)
-        .run(id, number, serviceType, tableId, guests, waiter || ctx.user, ctx.user, day, nowIso(), notes || '', tillDb().getSetting(db, 'device_id'));
+      db.prepare(`INSERT INTO r_orders (id, number, service_type, table_id, guests, waiter, opened_by, status, business_date, opened_at, notes, device_id, pricing)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)`)
+        .run(id, number, serviceType, tableId, guests, waiter || ctx.user, ctx.user, day, nowIso(), notes || '', tillDb().getSetting(db, 'device_id'),
+          JSON.stringify(pricingNow(db, day)));
     } catch (e) {
       if (/UNIQUE/.test(String(e.message))) throw new RestaurantError('table_occupied', 'That table already has an open order.', 409);
       throw e;
@@ -678,6 +698,9 @@ function orderDoc(db, orderId) {
     id: v.id, number: v.number, service_type: v.service_type, table_id: v.table_id, guests: v.guests, waiter: v.waiter,
     opened_by: v.opened_by, status: v.status, business_date: v.business_date, opened_at: v.opened_at, closed_at: v.closed_at,
     cancel_reason: v.cancel_reason, notes: v.notes,
+    // Everything the cloud needs to work the bill out again from this document alone (never from
+    // today's settings): the frozen service charge and tax rules, and the discount as entered.
+    pricing: pricingOf(db, getOrderRow(db, orderId)),
     items: v.items.map((i) => ({ id: i.id, menu_item_id: i.menu_item_id, name: i.name, unit_price: i.unit_price, modifiers_price: i.modifiers_price,
       tax_class: i.tax_class, quantity: i.quantity, voided_quantity: i.voided_quantity, state: i.state, waste: Boolean(i.waste),
       void_reason: i.void_reason, notes: i.notes, sent_at: i.sent_at, served_at: i.served_at,
@@ -685,6 +708,7 @@ function orderDoc(db, orderId) {
     tickets,
     bill: v.bill && {
       id: v.bill.id, number: v.bill.number, status: v.bill.status, subtotal: v.bill.subtotal, discount: v.bill.discount,
+      discount_spec: v.bill.discount_spec ? JSON.parse(v.bill.discount_spec) : null,
       discount_reason: v.bill.discount_reason, net: v.bill.net, total: v.bill.total, charges: v.bill.charges,
       payments: v.bill.payments.map((p) => ({ id: p.id, method: p.method, amount: p.amount, tendered: p.tendered, change: p.change, tip: p.tip,
         reference: p.reference, shift_ref: p.shift_id, received_by: p.received_by, received_at: p.received_at })),
