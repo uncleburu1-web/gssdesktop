@@ -8,6 +8,7 @@ import SalesHistoryScreen from './SalesHistoryScreen.jsx';
 import PrinterSettingsScreen from './PrinterSettingsScreen.jsx';
 import ShiftScreen from './ShiftScreen.jsx';
 import DayReportScreen from './DayReport.jsx';
+import RestaurantScreen from './restaurant/RestaurantScreen.jsx';
 import { Icons } from './Icons.jsx';
 import { fmtRelative } from './format.js';
 
@@ -18,6 +19,9 @@ function Shell() {
   const [saleTick, setSaleTick] = useState(0);
   const [pendingSync, setPendingSync] = useState(0);
   const [syncStatus, setSyncStatus] = useState(null);
+  // Restaurant branches get a Restaurant screen. The owner can switch the module on or off at any
+  // time (the till learns it from the pull), so this is checked again every few seconds.
+  const [restaurantOn, setRestaurantOn] = useState(false);
   const { theme, toggleTheme } = useTheme();
 
   // What the sidebar tells the cashier about getting data to the cloud. "All changes synced" must
@@ -58,6 +62,14 @@ function Shell() {
     const check = () => window.pos.pendingSyncCount().then(setPendingSync);
     check();
     const t = setInterval(check, 5000);
+    return () => clearInterval(t);
+  }, [loggedIn]);
+
+  useEffect(() => {
+    if (!loggedIn || !window.pos.restaurant) return;
+    const check = () => window.pos.restaurant('status', null).then((res) => setRestaurantOn(Boolean(res && res.ok && res.data.restaurant))).catch(() => {});
+    check();
+    const t = setInterval(check, 15000);
     return () => clearInterval(t);
   }, [loggedIn]);
 
@@ -121,6 +133,7 @@ function Shell() {
     <div style={{ display: 'flex', height: '100vh' }}>
       <div style={{ width: 200, borderRight: '1px solid var(--border)', display: 'flex', flexDirection: 'column', padding: 14 }}>
         <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 18, padding: '0 6px' }}>{profile?.shop_name || 'My Shop'}</div>
+        {restaurantOn && <NavButton active={view === 'restaurant'} onClick={() => setView('restaurant')}>Restaurant</NavButton>}
         <NavButton active={view === 'sell'} onClick={() => setView('sell')}>{Icons.cart} Sell</NavButton>
         <NavButton active={view === 'products'} onClick={() => setView('products')}>Products</NavButton>
         <NavButton active={view === 'customers'} onClick={() => setView('customers')}>Customers</NavButton>
@@ -184,6 +197,7 @@ function Shell() {
         {view === 'shift' && <ShiftScreen refreshKey={saleTick} profile={profile} />}
         {view === 'dayreport' && <DayReportScreen profile={profile} seesEveryone={seesEveryone} />}
         {view === 'printer' && <PrinterSettingsScreen profile={profile} />}
+        {view === 'restaurant' && restaurantOn && <RestaurantScreen profile={profile} />}
       </div>
     </div>
   );
