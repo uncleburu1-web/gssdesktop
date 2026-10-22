@@ -4,6 +4,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 // narrow surface, no direct filesystem/db/network access from the
 // renderer process at all.
 contextBridge.exposeInMainWorld('pos', {
+  // Restaurant (hub till): restaurant('order', null, orderId), restaurant('send', idempotencyKey, orderId), ...
+  restaurant: (action, key, ...args) => ipcRenderer.invoke('restaurant:call', action, key, ...args),
   listProducts: (params) => ipcRenderer.invoke('pos:listProducts', params),
   createProduct: (input) => ipcRenderer.invoke('pos:createProduct', input),
   listCustomers: (params) => ipcRenderer.invoke('pos:listCustomers', params),

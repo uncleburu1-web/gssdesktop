@@ -245,6 +245,9 @@ app.whenReady().then(() => {
     });
   }));
 
+  // Restaurant screens (hub till): one IPC channel with a fixed list of actions; kitchen printing.
+  require('./restaurant/ipc').register({ ipcMain, database, auth, BrowserWindow });
+
   createWindow();
   // Passed as a getter, not the value itself, since a user can close and
   // reopen the window (see the app.on('activate') handler below) — the

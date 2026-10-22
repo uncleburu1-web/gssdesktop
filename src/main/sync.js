@@ -1,4 +1,6 @@
 const { getAccessToken, refreshSession } = require('./auth');
+const restaurantStore = require('./restaurant/store');
+const restaurantEngine = require('./restaurant/engine');
 const {
   applyPulledOperation, getLastPullAt, setLastPullAt, pruneSyncQueue, reconcileUnsyncedRows, getSyncQueueStats,
   getSetting, setSetting,
@@ -418,8 +420,12 @@ function startSyncEngine(db, onDataChanged) {
       // The cloud just learned new record kinds (e.g. shifts at 3): queue what this till holds of
       // them now, instead of waiting for the next restart's reconcile.
       if (reconcileUnsyncedRows(db) > 0) setImmediate(() => pushNow());
+      // Restaurant orders finished while the cloud could not take them yet (protocol < 6).
+      if (restaurantEngine.reconcileOrders(db) > 0) setImmediate(() => pushNow());
     }
     if (protocol >= 4 && !getSetting(db, 'stock_movements_backfilled')) await backfillStockMovements();
+    refreshBranchModules(firstBody.modules);
+    if (isRestaurantBranch()) await pullRestaurantConfig();
     // Cursor from the SERVER's clock, not this machine's. next_since (from the FIRST page, the
     // earliest read) is already moved back behind the read, so a row committed while this pull was
     // reading comes back next time instead of being skipped forever (G4). Older clouds: server_time.
@@ -458,6 +464,65 @@ function startSyncEngine(db, onDataChanged) {
     } while (cursor && pages < MAX_PULL_PAGES);
     if (cursor) return;
     setSetting(db, 'stock_movements_backfilled', new Date().toISOString());
+    if (changed.length > 0) onDataChanged?.(changed);
+  }
+
+  /**
+   * The branch's modules as the cloud has them now. Sign-in saves them too, but an owner can switch
+   * the restaurant on or off at any time; the cloud announces that live, so the till pulls and picks
+   * it up here within seconds. An older cloud does not send `modules`: the sign-in value stays.
+   */
+  function refreshBranchModules(modules) {
+    if (!Array.isArray(modules)) return;
+    let shop;
+    try { shop = JSON.parse(getSetting(db, 'shop_settings') || 'null'); } catch { shop = null; }
+    if (!shop) return;
+    const next = [...modules].sort();
+    if (JSON.stringify([...(shop.modules || [])].sort()) === JSON.stringify(next)) return;
+    setSetting(db, 'shop_settings', JSON.stringify({ ...shop, modules: next }));
+  }
+
+  /** Is this till's branch a restaurant branch? (modules from sign-in, kept current by the pull) */
+  function isRestaurantBranch() {
+    try {
+      const shop = JSON.parse(getSetting(db, 'shop_settings') || '{}');
+      return Array.isArray(shop.modules) && shop.modules.includes('restaurant');
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Restaurant configuration (menu, tables, stations, taxes, settings). The cloud sends these only
+   * when they are asked for by name AND the branch is a restaurant branch, so this pass has its own
+   * cursor and runs only on restaurant branches. Same paging and overlap rules as the main pull;
+   * applying a row twice is harmless (plain upserts).
+   */
+  async function pullRestaurantConfig() {
+    const since = getSetting(db, 'restaurant_last_pull_at');
+    let cursor = null;
+    let first = null;
+    let pages = 0;
+    const changed = [];
+    const skipped = [];
+    do {
+      const body = await fetchPullPage(since, cursor, restaurantStore.PULL_TYPES.join(','));
+      if (!body) return; // try again next pull; the cursor is not advanced
+      first = first || body;
+      const operations = body.operations || [];
+      for (let i = 0; i < operations.length; i += PULL_APPLY_CHUNK) {
+        applyChunk(operations.slice(i, i + PULL_APPLY_CHUNK), skipped);
+        await tick();
+      }
+      changed.push(...operations);
+      pages += 1;
+      cursor = body.has_more && body.next_cursor ? body.next_cursor : null;
+    } while (cursor && pages < MAX_PULL_PAGES);
+    // A row that would not apply is skipped like in the main pull, and counted in the same place so
+    // the sync status shows it instead of a menu item silently missing on the hub.
+    lastPullSkipped += skipped.length;
+    if (cursor) return;
+    setSetting(db, 'restaurant_last_pull_at', first.next_since || first.server_time || new Date().toISOString());
     if (changed.length > 0) onDataChanged?.(changed);
   }
 

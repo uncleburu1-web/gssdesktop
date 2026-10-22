@@ -1,0 +1,222 @@
+{
+  "_about": "Shared bill cases. Every expected figure was worked out by hand (see each 'why'), not produced by either implementation. Python: restaurant/billing.py. JavaScript: gssdesktop/src/main/restaurant/billing.js (test/billing_vectors.json is a byte-for-byte copy).",
+  "cases": [
+    {
+      "name": "the owner's Lagos example",
+      "why": "net 48,000; service 10% = 4,800 (not taxed); Lagos 5% of 48,000 = 2,400; VAT 7.5% of 48,000 = 3,600; total 58,800",
+      "input": {
+        "service_type": "dine_in", "business_date": "2026-10-21",
+        "lines": [
+          {"id": "l1", "unit_price": "30000.00", "quantity": "1", "tax_class": "food"},
+          {"id": "l2", "unit_price": "10000.00", "quantity": "2", "tax_class": "drink"}
+        ],
+        "discount": {"type": "amount", "value": "2000.00"},
+        "service_charge": {"rate": "10", "service_types": ["dine_in"]},
+        "tax_rules": [
+          {"id": "lagos", "name": "Lagos consumption tax", "rate": "5", "inclusive": false, "tax_classes": [], "applies_to_service_charge": false, "valid_from": "2026-01-01", "valid_to": null, "is_active": true},
+          {"id": "vat", "name": "VAT", "rate": "7.5", "inclusive": false, "tax_classes": [], "applies_to_service_charge": false, "valid_from": "2026-01-01", "valid_to": null, "is_active": true}
+        ]
+      },
+      "expect": {
+        "subtotal": "50000.00", "discount": "2000.00", "net": "48000.00",
+        "charges": [
+          {"kind": "service_charge", "tax_rule_id": null, "name": "Service charge", "rate": "10.0000", "inclusive": false, "base": "48000.00", "amount": "4800.00"},
+          {"kind": "tax", "tax_rule_id": "lagos", "name": "Lagos consumption tax", "rate": "5.0000", "inclusive": false, "base": "48000.00", "amount": "2400.00"},
+          {"kind": "tax", "tax_rule_id": "vat", "name": "VAT", "rate": "7.5000", "inclusive": false, "base": "48000.00", "amount": "3600.00"}
+        ],
+        "total": "58800.00"
+      }
+    },
+    {
+      "name": "takeaway: no service charge, no taxes",
+      "why": "service applies to dine-in only; no rules; total = 3 x 500",
+      "input": {
+        "service_type": "takeaway", "business_date": "2026-10-21",
+        "lines": [{"id": "l1", "unit_price": "500.00", "quantity": "3", "tax_class": "food"}],
+        "discount": null, "service_charge": {"rate": "10", "service_types": ["dine_in"]}, "tax_rules": []
+      },
+      "expect": {"subtotal": "1500.00", "discount": "0.00", "net": "1500.00", "charges": [], "total": "1500.00"}
+    },
+    {
+      "name": "VAT already inside the menu price",
+      "why": "10,750 x 7.5 / 107.5 = 750 is shown, not added",
+      "input": {
+        "service_type": "counter", "business_date": "2026-10-21",
+        "lines": [{"id": "l1", "unit_price": "10750.00", "quantity": "1", "tax_class": "food"}],
+        "discount": null, "service_charge": null,
+        "tax_rules": [{"id": "vat", "name": "VAT", "rate": "7.5", "inclusive": true, "tax_classes": [], "applies_to_service_charge": false, "valid_from": "2026-01-01", "valid_to": null, "is_active": true}]
+      },
+      "expect": {"subtotal": "10750.00", "discount": "0.00", "net": "10750.00",
+                 "charges": [{"kind": "tax", "tax_rule_id": "vat", "name": "VAT", "rate": "7.5000", "inclusive": true, "base": "10750.00", "amount": "750.00"}],
+                 "total": "10750.00"}
+    },
+    {
+      "name": "a tax that covers drinks only",
+      "why": "5% of the 500 drink = 25; food untouched",
+      "input": {
+        "service_type": "dine_in", "business_date": "2026-10-21",
+        "lines": [{"id": "l1", "unit_price": "1000.00", "quantity": "1", "tax_class": "food"},
+                  {"id": "l2", "unit_price": "500.00", "quantity": "1", "tax_class": "drink"}],
+        "discount": null, "service_charge": null,
+        "tax_rules": [{"id": "lev", "name": "Drink levy", "rate": "5", "inclusive": false, "tax_classes": ["drink"], "applies_to_service_charge": false, "valid_from": "2026-01-01", "valid_to": null, "is_active": true}]
+      },
+      "expect": {"subtotal": "1500.00", "discount": "0.00", "net": "1500.00",
+                 "charges": [{"kind": "tax", "tax_rule_id": "lev", "name": "Drink levy", "rate": "5.0000", "inclusive": false, "base": "500.00", "amount": "25.00"}],
+                 "total": "1525.00"}
+    },
+    {
+      "name": "a discount is shared across items before a class tax",
+      "why": "10% off 2,000 = 200; the drink's share of the 1,800 net is 900; 5% of 900 = 45",
+      "input": {
+        "service_type": "dine_in", "business_date": "2026-10-21",
+        "lines": [{"id": "l1", "unit_price": "1000.00", "quantity": "1", "tax_class": "food"},
+                  {"id": "l2", "unit_price": "1000.00", "quantity": "1", "tax_class": "drink"}],
+        "discount": {"type": "percent", "value": "10"}, "service_charge": null,
+        "tax_rules": [{"id": "lev", "name": "Drink levy", "rate": "5", "inclusive": false, "tax_classes": ["drink"], "applies_to_service_charge": false, "valid_from": "2026-01-01", "valid_to": null, "is_active": true}]
+      },
+      "expect": {"subtotal": "2000.00", "discount": "200.00", "net": "1800.00",
+                 "charges": [{"kind": "tax", "tax_rule_id": "lev", "name": "Drink levy", "rate": "5.0000", "inclusive": false, "base": "900.00", "amount": "45.00"}],
+                 "total": "1845.00"}
+    },
+    {
+      "name": "rounding: 24.99975 becomes 25.00",
+      "why": "333.33 x 7.5% = 24.99975, half-up to the kobo",
+      "input": {
+        "service_type": "counter", "business_date": "2026-10-21",
+        "lines": [{"id": "l1", "unit_price": "333.33", "quantity": "1", "tax_class": "food"}],
+        "discount": null, "service_charge": null,
+        "tax_rules": [{"id": "vat", "name": "VAT", "rate": "7.5", "inclusive": false, "tax_classes": [], "applies_to_service_charge": false, "valid_from": "2026-01-01", "valid_to": null, "is_active": true}]
+      },
+      "expect": {"subtotal": "333.33", "discount": "0.00", "net": "333.33",
+                 "charges": [{"kind": "tax", "tax_rule_id": "vat", "name": "VAT", "rate": "7.5000", "inclusive": false, "base": "333.33", "amount": "25.00"}],
+                 "total": "358.33"}
+    },
+    {
+      "name": "rounding: exactly half a kobo rounds up",
+      "why": "0.30 x 5% = 0.015 -> 0.02",
+      "input": {
+        "service_type": "counter", "business_date": "2026-10-21",
+        "lines": [{"id": "l1", "unit_price": "0.30", "quantity": "1", "tax_class": "food"}],
+        "discount": null, "service_charge": null,
+        "tax_rules": [{"id": "t", "name": "Levy", "rate": "5", "inclusive": false, "tax_classes": [], "applies_to_service_charge": false, "valid_from": "2026-01-01", "valid_to": null, "is_active": true}]
+      },
+      "expect": {"subtotal": "0.30", "discount": "0.00", "net": "0.30",
+                 "charges": [{"kind": "tax", "tax_rule_id": "t", "name": "Levy", "rate": "5.0000", "inclusive": false, "base": "0.30", "amount": "0.02"}],
+                 "total": "0.32"}
+    },
+    {
+      "name": "a tax that also covers the service charge",
+      "why": "net 10,000; service 1,000; VAT on 11,000 = 825",
+      "input": {
+        "service_type": "dine_in", "business_date": "2026-10-21",
+        "lines": [{"id": "l1", "unit_price": "10000.00", "quantity": "1", "tax_class": "food"}],
+        "discount": null, "service_charge": {"rate": "10", "service_types": ["dine_in"]},
+        "tax_rules": [{"id": "vat", "name": "VAT", "rate": "7.5", "inclusive": false, "tax_classes": [], "applies_to_service_charge": true, "valid_from": "2026-01-01", "valid_to": null, "is_active": true}]
+      },
+      "expect": {"subtotal": "10000.00", "discount": "0.00", "net": "10000.00",
+                 "charges": [{"kind": "service_charge", "tax_rule_id": null, "name": "Service charge", "rate": "10.0000", "inclusive": false, "base": "10000.00", "amount": "1000.00"},
+                             {"kind": "tax", "tax_rule_id": "vat", "name": "VAT", "rate": "7.5000", "inclusive": false, "base": "11000.00", "amount": "825.00"}],
+                 "total": "11825.00"}
+    },
+    {
+      "name": "only rules active and valid on the business date apply",
+      "why": "the old rule ended in 2025 and the draft is not active; VAT 7.5% of 1,000 = 75",
+      "input": {
+        "service_type": "counter", "business_date": "2026-10-21",
+        "lines": [{"id": "l1", "unit_price": "1000.00", "quantity": "1", "tax_class": "food"}],
+        "discount": null, "service_charge": null,
+        "tax_rules": [
+          {"id": "old", "name": "Old levy", "rate": "2", "inclusive": false, "tax_classes": [], "applies_to_service_charge": false, "valid_from": "2025-01-01", "valid_to": "2025-12-31", "is_active": true},
+          {"id": "draft", "name": "Draft", "rate": "9", "inclusive": false, "tax_classes": [], "applies_to_service_charge": false, "valid_from": "2026-01-01", "valid_to": null, "is_active": false},
+          {"id": "future", "name": "Future", "rate": "3", "inclusive": false, "tax_classes": [], "applies_to_service_charge": false, "valid_from": "2026-11-01", "valid_to": null, "is_active": true},
+          {"id": "vat", "name": "VAT", "rate": "7.5", "inclusive": false, "tax_classes": [], "applies_to_service_charge": false, "valid_from": "2026-01-01", "valid_to": null, "is_active": true}
+        ]
+      },
+      "expect": {"subtotal": "1000.00", "discount": "0.00", "net": "1000.00",
+                 "charges": [{"kind": "tax", "tax_rule_id": "vat", "name": "VAT", "rate": "7.5000", "inclusive": false, "base": "1000.00", "amount": "75.00"}],
+                 "total": "1075.00"}
+    },
+    {
+      "name": "modifiers and a part-voided line (the API example)",
+      "why": "(3,500 + 500 large) x (3 - 1 voided) = 8,000; service 800; VAT 600; total 9,400",
+      "input": {
+        "service_type": "dine_in", "business_date": "2026-10-21",
+        "lines": [{"id": "l1", "unit_price": "3500.00", "modifiers_price": "500.00", "quantity": "3", "voided_quantity": "1", "tax_class": "food"}],
+        "discount": null, "service_charge": {"rate": "10", "service_types": ["dine_in"]},
+        "tax_rules": [{"id": "vat", "name": "VAT", "rate": "7.5", "inclusive": false, "tax_classes": [], "applies_to_service_charge": false, "valid_from": "2026-01-01", "valid_to": null, "is_active": true}]
+      },
+      "expect": {"subtotal": "8000.00", "discount": "0.00", "net": "8000.00",
+                 "charges": [{"kind": "service_charge", "tax_rule_id": null, "name": "Service charge", "rate": "10.0000", "inclusive": false, "base": "8000.00", "amount": "800.00"},
+                             {"kind": "tax", "tax_rule_id": "vat", "name": "VAT", "rate": "7.5000", "inclusive": false, "base": "8000.00", "amount": "600.00"}],
+                 "total": "9400.00"}
+    },
+    {
+      "name": "a discount bigger than the bill is refused",
+      "why": "600 off a 500 bill",
+      "input": {
+        "service_type": "counter", "business_date": "2026-10-21",
+        "lines": [{"id": "l1", "unit_price": "500.00", "quantity": "1", "tax_class": "food"}],
+        "discount": {"type": "amount", "value": "600.00"}, "service_charge": null, "tax_rules": []
+      },
+      "expect": {"error": "discount_too_large"}
+    },
+    {
+      "name": "percent discount rounds half-up",
+      "why": "15% of 333.33 = 49.9995 -> 50.00",
+      "input": {
+        "service_type": "counter", "business_date": "2026-10-21",
+        "lines": [{"id": "l1", "unit_price": "333.33", "quantity": "1", "tax_class": "food"}],
+        "discount": {"type": "percent", "value": "15"}, "service_charge": null, "tax_rules": []
+      },
+      "expect": {"subtotal": "333.33", "discount": "50.00", "net": "283.33", "charges": [], "total": "283.33"}
+    },
+    {
+      "name": "VAT inside the price, Lagos tax on the bill excluding VAT",
+      "why": "10,750 includes 750 VAT; the price before VAT is 10,000; Lagos 5% of 10,000 = 500 is added",
+      "input": {
+        "service_type": "counter", "business_date": "2026-10-21",
+        "lines": [{"id": "l1", "unit_price": "10750.00", "quantity": "1", "tax_class": "food"}],
+        "discount": null, "service_charge": null,
+        "tax_rules": [
+          {"id": "vat", "name": "VAT", "rate": "7.5", "inclusive": true, "tax_classes": [], "applies_to_service_charge": false, "valid_from": "2026-01-01", "valid_to": null, "is_active": true},
+          {"id": "lagos", "name": "Lagos consumption tax", "rate": "5", "inclusive": false, "tax_classes": [], "applies_to_service_charge": false, "valid_from": "2026-01-01", "valid_to": null, "is_active": true}
+        ]
+      },
+      "expect": {"subtotal": "10750.00", "discount": "0.00", "net": "10750.00",
+                 "charges": [{"kind": "tax", "tax_rule_id": "vat", "name": "VAT", "rate": "7.5000", "inclusive": true, "base": "10750.00", "amount": "750.00"},
+                             {"kind": "tax", "tax_rule_id": "lagos", "name": "Lagos consumption tax", "rate": "5.0000", "inclusive": false, "base": "10000.00", "amount": "500.00"}],
+                 "total": "11250.00"}
+    },
+    {
+      "name": "two taxes both inside the price",
+      "why": "11,000 includes 10% in all: VAT 11,000 x 7.5/110 = 750, levy 11,000 x 2.5/110 = 250",
+      "input": {
+        "service_type": "counter", "business_date": "2026-10-21",
+        "lines": [{"id": "l1", "unit_price": "11000.00", "quantity": "1", "tax_class": "food"}],
+        "discount": null, "service_charge": null,
+        "tax_rules": [
+          {"id": "vat", "name": "VAT", "rate": "7.5", "inclusive": true, "tax_classes": [], "applies_to_service_charge": false, "valid_from": "2026-01-01", "valid_to": null, "is_active": true},
+          {"id": "lev", "name": "Levy", "rate": "2.5", "inclusive": true, "tax_classes": [], "applies_to_service_charge": false, "valid_from": "2026-01-01", "valid_to": null, "is_active": true}
+        ]
+      },
+      "expect": {"subtotal": "11000.00", "discount": "0.00", "net": "11000.00",
+                 "charges": [{"kind": "tax", "tax_rule_id": "vat", "name": "VAT", "rate": "7.5000", "inclusive": true, "base": "11000.00", "amount": "750.00"},
+                             {"kind": "tax", "tax_rule_id": "lev", "name": "Levy", "rate": "2.5000", "inclusive": true, "base": "11000.00", "amount": "250.00"}],
+                 "total": "11000.00"}
+    },
+    {
+      "name": "service charge on a VAT-inclusive price uses the price before VAT",
+      "why": "10,750 incl. VAT = 10,000 before VAT; service 10% of 10,000 = 1,000; VAT 750 stays inside",
+      "input": {
+        "service_type": "dine_in", "business_date": "2026-10-21",
+        "lines": [{"id": "l1", "unit_price": "10750.00", "quantity": "1", "tax_class": "food"}],
+        "discount": null, "service_charge": {"rate": "10", "service_types": ["dine_in"]},
+        "tax_rules": [{"id": "vat", "name": "VAT", "rate": "7.5", "inclusive": true, "tax_classes": [], "applies_to_service_charge": false, "valid_from": "2026-01-01", "valid_to": null, "is_active": true}]
+      },
+      "expect": {"subtotal": "10750.00", "discount": "0.00", "net": "10750.00",
+                 "charges": [{"kind": "service_charge", "tax_rule_id": null, "name": "Service charge", "rate": "10.0000", "inclusive": false, "base": "10000.00", "amount": "1000.00"},
+                             {"kind": "tax", "tax_rule_id": "vat", "name": "VAT", "rate": "7.5000", "inclusive": true, "base": "10750.00", "amount": "750.00"}],
+                 "total": "11750.00"}
+    }
+  ]
+}

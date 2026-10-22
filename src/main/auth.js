@@ -262,6 +262,9 @@ async function login(db, username, password) {
         // has no way to tell a clothing or general-retail shop apart from
         // a gadgets shop, and everyone gets offered "Laptop".
         business_type: me.business_type || 'general',
+        // Which modules this till's branch uses (retail / restaurant / service); the restaurant screens
+        // and the restaurant part of the pull only exist where 'restaurant' is on.
+        modules: Array.isArray(me.modules) ? me.modules : ['retail'],
       });
       const profile = {
         username: me.username,
