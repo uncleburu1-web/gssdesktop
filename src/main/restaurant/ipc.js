@@ -7,6 +7,10 @@
 const engine = require('./engine');
 const printing = require('./printing');
 const store = require('./store');
+const screens = require('./screens');
+const lanServer = require('./server');
+
+let lan = null; // the kitchen-screen server (createLan), once registered
 
 function contextFor(profile) {
   if (!profile || !profile.username) throw new store.RestaurantError('not_signed_in', 'Sign in first.', 401);
@@ -46,6 +50,10 @@ const ACTIONS = {
   soldOut: (db, ctx, key, menuItemId, value) => engine.setSoldOut(db, menuItemId, value, ctx, key),
   reprint: (db, ctx, key, ticketId) => printing.reprint(db, ticketId, ctx, key),
   setStationPrinter: (db, ctx, key, stationId, deviceName) => printing.setStationPrinter(db, stationId, deviceName, ctx),
+  // kitchen screens on the Wi-Fi (owner / manager)
+  screens: (db) => ({ screens: screens.listScreens(db), lan: lan ? lan.status() : null }),
+  addScreen: (db, ctx, key, input) => ({ ...screens.createPairingCode(db, input, ctx), lan: lan ? lan.status() : null }),
+  removeScreen: (db, ctx, key, screenId) => screens.revokeScreen(db, screenId, ctx),
 };
 
 /** Print one kitchen ticket silently to a named Windows printer, through a hidden window. */
@@ -63,11 +71,13 @@ function makePrintHtml(BrowserWindow) {
   });
 }
 
-function register({ ipcMain, database, auth, BrowserWindow }) {
+function register({ ipcMain, database, auth, BrowserWindow, appVersion = '', cloudStatus = () => null, onChange = () => {}, lanOptions = {} }) {
   printing.recoverAfterRestart(database); // never reprint blindly after a power cut
   store.prune(database);
   const printHtml = makePrintHtml(BrowserWindow);
   const kickPrinting = () => printing.runQueue(database, printHtml).catch((e) => console.warn('[restaurant] printing stopped:', e.message));
+  if (lan) lan.stop();
+  lan = lanServer.createLan(database, { appVersion, cloudStatus, ...lanOptions });
 
   ipcMain.handle('restaurant:call', (_e, action, key, ...args) => {
     // `status` tells the screens whether this till is the hub (and why not), so they can say so.
@@ -79,6 +89,8 @@ function register({ ipcMain, database, auth, BrowserWindow }) {
       store.assertHub(database); // only the branch's hub runs the restaurant
       const data = fn(database, ctx, key || null, ...args);
       kickPrinting();
+      lan.notify();  // kitchen screens hear about it at once
+      try { onChange(); } catch {} // e.g. upload a closed order straight away
       return { ok: true, data };
     } catch (e) {
       if (e instanceof store.RestaurantError) {
@@ -89,6 +101,7 @@ function register({ ipcMain, database, auth, BrowserWindow }) {
     }
   });
   if (store.hubStatus(database).is_hub) kickPrinting();
+  return { lan };
 }
 
 module.exports = { register, contextFor, ACTIONS, makePrintHtml };

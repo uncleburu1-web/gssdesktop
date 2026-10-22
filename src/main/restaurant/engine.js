@@ -181,7 +181,7 @@ function kitchenView(db, stationIds) {
   const out = [];
   for (const t of tickets) {
     const its = db.prepare(
-      `SELECT ti.*, oi.name, oi.notes FROM r_ticket_items ti JOIN r_order_items oi ON oi.id = ti.order_item_id WHERE ti.ticket_id = ? ORDER BY ti.rowid`
+      `SELECT ti.*, oi.name, oi.notes, oi.void_reason FROM r_ticket_items ti JOIN r_order_items oi ON oi.id = ti.order_item_id WHERE ti.ticket_id = ? ORDER BY ti.rowid`
     ).all(t.id).map((i) => ({ ...i, modifiers: db.prepare(`SELECT name FROM r_order_item_modifiers WHERE order_item_id = ?`).all(i.order_item_id).map((m) => m.name) }));
     if (its.some((i) => ['queued', 'preparing', 'ready'].includes(i.state))) out.push({ ...t, items: its });
   }
