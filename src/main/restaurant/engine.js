@@ -428,10 +428,16 @@ function serveItem(db, orderItemId, ctx, key) {
     if (item.state === 'served') return orderView(db, item.order_id);
     if (item.state !== 'sent') throw new RestaurantError('not_sent', 'Send the item to the kitchen first.', 409);
     const live = ticketItemsOf(db, orderItemId).filter((t) => t.state !== 'voided');
-    if (live.some((t) => t.state === 'queued' || t.state === 'preparing')) throw new RestaurantError('not_ready', 'The kitchen has not finished this item.', 409);
+    // A station with a kitchen screen says when food is ready; serving waits for it. A printer-only
+    // station has nobody to tap "ready" on a device: the waiter collecting the plate at the pass is
+    // that signal, so it can be served straight away (as items with no kitchen at all, T5).
+    const waiting = live.filter((t) => t.state === 'queued' || t.state === 'preparing');
+    if (waiting.some((t) => { const st = store.station(db, t.station_id); return st && st.shows_on_screen; })) {
+      throw new RestaurantError('not_ready', 'The kitchen has not finished this item.', 409);
+    }
     const ts = nowIso();
-    for (const t of live.filter((x) => x.state === 'ready')) {
-      db.prepare(`UPDATE r_ticket_items SET state = 'served', version = version + 1, served_at = ? WHERE id = ?`).run(ts, t.id);
+    for (const t of live.filter((x) => x.state === 'ready' || x.state === 'queued' || x.state === 'preparing')) {
+      db.prepare(`UPDATE r_ticket_items SET state = 'served', version = version + 1, ready_at = COALESCE(ready_at, ?), served_at = ? WHERE id = ?`).run(ts, ts, t.id);
       store.emit(db, 'ticket.item_changed', { stationIds: [t.station_id], entityType: 'ticket_item', entityId: t.id, data: { state: 'served', version: t.version + 1, order_id: item.order_id } });
     }
     db.prepare(`UPDATE r_order_items SET state = 'served', served_at = ? WHERE id = ?`).run(ts, orderItemId);

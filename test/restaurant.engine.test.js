@@ -319,6 +319,21 @@ test('service charge and taxes are frozen when the order opens: a change in the 
   } finally { cleanup(); }
 });
 
+test('serving: a station with a kitchen screen must mark food ready first; a printer-only station is served from the pass', () => {
+  const { db, cleanup } = hub();
+  try {
+    const o = engine.openOrder(db, { service_type: 'dine_in', table_id: ID.t1 }, waiter);
+    engine.addItems(db, o.id, [{ menu_item_id: ID.jollof, modifiers: [ID.regular] }, { menu_item_id: ID.chapman }], waiter);
+    engine.sendToKitchen(db, o.id, waiter);
+    const [jollof, chapman] = ['Jollof rice', 'Chapman'].map((n) => engine.orderView(db, o.id).items.find((i) => i.name === n));
+    assert.throws(() => engine.serveItem(db, jollof.id, waiter), { code: 'not_ready' }, 'Kitchen has a screen: wait for "ready"');
+    const served = engine.serveItem(db, chapman.id, waiter);
+    assert.equal(served.items.find((i) => i.name === 'Chapman').state, 'served', 'Bar only prints: the waiter serves from the pass');
+    const ti = db.prepare(`SELECT state, ready_at, served_at FROM r_ticket_items WHERE order_item_id = ?`).get(chapman.id);
+    assert.deepEqual([ti.state, Boolean(ti.ready_at), Boolean(ti.served_at)], ['served', true, true]);
+  } finally { cleanup(); }
+});
+
 test('an older cloud cannot take orders yet: they wait on the hub and go up once it upgrades', () => {
   const { db, cleanup } = hub({ protocol: 5 });
   try {

@@ -30,6 +30,7 @@ const ACTIONS = {
   order: (db, ctx, key, orderId) => engine.orderView(db, orderId),
   kitchen: (db, ctx, key, stationIds) => engine.kitchenView(db, stationIds || store.activeStationIds(db)),
   events: (db, ctx, key, afterSeq) => store.eventsAfter(db, afterSeq || 0),
+  seq: (db) => db.prepare(`SELECT COALESCE(MAX(seq), 0) AS n FROM r_events`).get().n, // where live updates start
   printers: (db) => printing.listStationPrinters(db),
   printProblems: (db) => printing.problems(db),
   // changes (T1–T13)
