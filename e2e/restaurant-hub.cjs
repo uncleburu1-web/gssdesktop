@@ -175,22 +175,47 @@ const list = (d) => (Array.isArray(d) ? d : d.results);
   check(rateOf(eating) === '10.0000' && rateOf(late) === '15.0000', 'a service charge changed mid-service: the open table keeps 10%, the next one gets 15%',
     `${rateOf(eating)} / ${rateOf(late)}`);
 
-  // ---- 5b. Audited actions while online with today's cloud (protocol 5) -----------------------
-  // The cloud accepts only a few till audit actions before protocol 6; restaurant ones must wait on
-  // the hub instead of becoming uploads the cloud refuses.
+  // ---- 5b. Audited actions while online ---------------------------------------------------------
   engine.setSoldOut(db, jollof.id, true, owner);
   require(D + '/src/main/restaurant/printing').reprint(db, db.prepare(`SELECT id FROM r_tickets LIMIT 1`).get().id, owner);
   await settle();
+  const protocol = Number(dbm.getSetting(db, 'cloud_sync_protocol'));
   const failed = db.prepare(`SELECT COUNT(*) n FROM sync_queue WHERE status = 'failed'`).get().n;
   const waiting = db.prepare(`SELECT COUNT(*) n FROM r_audit WHERE queued_at IS NULL`).get().n;
-  check(failed === 0 && waiting >= 2, 'sold-out and a reprint are audited on the hub, and nothing fails to upload', `failed ${failed}, kept ${waiting}`);
+  const pending = db.prepare(`SELECT COUNT(*) n FROM sync_queue WHERE status IN ('pending', 'failed')`).get().n;
+  if (protocol < 6) {
+    // An older cloud accepts only a few till audit actions: restaurant ones wait on the hub.
+    check(failed === 0 && waiting >= 2, `cloud at protocol ${protocol}: audit entries wait on the hub, nothing fails to upload`, `failed ${failed}, kept ${waiting}`);
+  } else {
+    check(failed === 0 && waiting === 0 && pending === 0, `cloud at protocol ${protocol}: every audit entry uploaded, nothing failed or left over`,
+      `failed ${failed}, kept ${waiting}, pending ${pending}`);
+  }
 
   // ---- 6. The cashier's Z-report -------------------------------------------------------------
   const z = dbm.getShiftReport(db, dbm.getOpenShift(db, 'coowner').id);
   check(z.restaurant && z.restaurant.takings === 11162.5 && z.cash.expected === 2000 + 11162.5, 'the Z-report counts the restaurant cash',
     JSON.stringify(z.restaurant));
-  check(db.prepare(`SELECT COUNT(*) n FROM sync_queue WHERE entity_type = 'order_doc'`).get().n === 0 && engine.orderView(db, order.id).queued_at === null,
-    'the closed order waits on the hub until the cloud can take orders (protocol 6)');
+
+  // ---- 7. The finished order in the cloud ------------------------------------------------------
+  if (protocol < 6) {
+    check(db.prepare(`SELECT COUNT(*) n FROM sync_queue WHERE entity_type = 'order_doc'`).get().n === 0 && engine.orderView(db, order.id).queued_at === null,
+      'the closed order waits on the hub until the cloud can take orders (protocol 6)');
+  } else {
+    const cloudOrder = await api(ceo, 'GET', `/restaurant/orders/${order.id}/`, undefined, store);
+    check(cloudOrder.status === 'closed' && cloudOrder.bill.total === '11162.50' && cloudOrder.items.length === 2 && cloudOrder.tickets.length === 2,
+      'the closed order (taken offline) reached the cloud with its bill, items and tickets', `${cloudOrder.number} ₦${cloudOrder.bill.total}`);
+    const sale = await api(ceo, 'GET', `/sales/${cloudOrder.sale_id}/`, undefined, store);
+    check(Number(sale.total) === 11162.5, 'it is also a Sale of the same amount, so the existing reports count it', String(sale.total));
+    const docs = db.prepare(`SELECT COUNT(*) n FROM sync_queue WHERE entity_type = 'order_doc'`).get().n;
+    const cloudOrders = await api(ceo, 'GET', `/restaurant/orders/?date=${cloudOrder.business_date}`, undefined, store);
+    check(docs === 1 && cloudOrders.results.length === 1, 'uploaded exactly once', `queued ${docs}, in the cloud ${cloudOrders.results.length}`);
+    const summary = await api(ceo, 'GET', `/reports/restaurant/summary/?date=${cloudOrder.business_date}`, undefined, store);
+    check(summary.takings === '11162.50' && summary.service_charge === '950.00' && summary.taxes.length === 1 && summary.taxes[0].amount === '712.50',
+      'the restaurant summary: takings, service charge and VAT from the frozen bill', JSON.stringify({ takings: summary.takings, taxes: summary.taxes }));
+    const audits = await api(ceo, 'GET', `/audit/?action=restaurant.sold_out`, undefined, store);
+    const auditRows = Array.isArray(audits) ? audits : audits.results;
+    check(auditRows.some((a) => a.action === 'restaurant.sold_out'), 'the sold-out switch is in the cloud audit log');
+  }
 
   engineSync.stop();
   console.log(fails ? `\n${fails} FAILED` : '\nALL PASSED');

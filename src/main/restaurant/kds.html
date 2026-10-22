@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kitchen screen</title>
+<style>
+  :root {
+    --bg: #0e1013; --panel: #191c22; --panel-2: #22262e; --line: #2e333d; --text: #f3f5f8; --muted: #9aa3b2;
+    --amber: #f5a524; --red: #ef4444; --green: #22c55e; --blue: #3b82f6; --void: #6b7280;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; -webkit-tap-highlight-color: transparent; }
+  button { font: inherit; color: inherit; }
+  .bar { display: flex; align-items: center; gap: 16px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
+  .bar h1 { font-size: 20px; margin: 0; font-weight: 700; }
+  .bar .stations { color: var(--muted); font-size: 15px; }
+  .bar .spacer { flex: 1; }
+  .clock { font-size: 22px; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .conn { display: flex; align-items: center; gap: 8px; font-size: 15px; color: var(--muted); }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--void); }
+  .conn.live .dot { background: var(--green); }
+  .conn.down .dot { background: var(--red); animation: blink 1s infinite; }
+  .conn.down { color: var(--red); }
+  @keyframes blink { 50% { opacity: .3; } }
+  .sound { font-size: 13px; color: var(--muted); }
+  main { padding: 14px 16px 24px; }
+  .section-title { color: var(--muted); font-size: 14px; letter-spacing: .08em; text-transform: uppercase; margin: 18px 0 10px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 12px; align-items: start; }
+  .card { background: var(--panel); border: 2px solid var(--line); border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; }
+  .card.warn { border-color: var(--amber); }
+  .card.late { border-color: var(--red); }
+  .card .head { display: flex; align-items: baseline; gap: 10px; padding: 10px 12px; background: var(--panel-2); }
+  .card.warn .head { background: rgba(245,165,36,.18); }
+  .card.late .head { background: rgba(239,68,68,.22); }
+  .card .num { font-size: 22px; font-weight: 800; }
+  .card .where { font-size: 18px; font-weight: 700; }
+  .card .age { margin-left: auto; font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .card.warn .age { color: var(--amber); }
+  .card.late .age { color: var(--red); }
+  .card .sub { padding: 4px 12px 0; color: var(--muted); font-size: 14px; }
+  .items { list-style: none; margin: 0; padding: 6px 0; }
+  .item { display: flex; gap: 10px; width: 100%; text-align: left; background: none; border: 0; border-top: 1px solid var(--line);
+    padding: 10px 12px; cursor: pointer; min-height: 56px; align-items: flex-start; }
+  .item:first-child { border-top: 0; }
+  .item:active { background: var(--panel-2); }
+  .item[disabled] { cursor: default; }
+  .qty { font-size: 22px; font-weight: 800; min-width: 34px; }
+  .what { flex: 1; }
+  .name { font-size: 20px; font-weight: 700; line-height: 1.2; }
+  .mod { font-size: 16px; color: #d6dbe4; margin-top: 2px; }
+  .note { font-size: 16px; color: var(--amber); font-style: italic; margin-top: 2px; }
+  .pill { font-size: 13px; font-weight: 800; letter-spacing: .05em; padding: 4px 8px; border-radius: 6px; white-space: nowrap; align-self: center; }
+  .pill.queued { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); }
+  .pill.preparing { background: var(--blue); color: #fff; }
+  .pill.ready { background: var(--green); color: #06210f; }
+  .pill.served, .pill.voided { background: transparent; color: var(--void); border: 1px solid var(--void); }
+  .item.voided .name, .item.voided .qty, .item.served .name, .item.served .qty { text-decoration: line-through; color: var(--void); }
+  .item.voided .reason { color: var(--red); font-size: 15px; margin-top: 2px; text-decoration: none; }
+  .bump { margin: 4px 12px 12px; padding: 14px; border-radius: 8px; border: 0; background: var(--green); color: #06210f; font-size: 18px; font-weight: 800; cursor: pointer; }
+  .bump:active { filter: brightness(.9); }
+  .ready-row .card { opacity: .75; }
+  .ready-row .card .head { padding: 8px 12px; }
+  .empty { color: var(--muted); font-size: 20px; text-align: center; padding: 80px 16px; }
+  .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: #2b1618; color: #ffd7d7; border: 1px solid var(--red);
+    padding: 12px 18px; border-radius: 8px; font-size: 16px; max-width: calc(100% - 32px); display: none; z-index: 5; }
+  .pair { max-width: 420px; margin: 12vh auto 0; padding: 28px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; text-align: center; }
+  .pair h1 { margin: 0 0 8px; font-size: 26px; }
+  .pair p { color: var(--muted); font-size: 16px; line-height: 1.45; margin: 0 0 20px; }
+  .pair input { width: 100%; font-size: 40px; letter-spacing: .3em; text-align: center; padding: 10px; border-radius: 8px;
+    border: 2px solid var(--line); background: var(--bg); color: var(--text); font-variant-numeric: tabular-nums; }
+  .pair input:focus { outline: none; border-color: var(--blue); }
+  .pair button { width: 100%; margin-top: 14px; padding: 14px; font-size: 18px; font-weight: 800; border: 0; border-radius: 8px; background: var(--blue); color: #fff; cursor: pointer; }
+  .pair .err { color: var(--red); min-height: 22px; margin-top: 12px; font-size: 15px; }
+  [hidden] { display: none !important; }
+  @media (max-width: 520px) { .bar { flex-wrap: wrap; gap: 8px 12px; } .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div id="pairView" hidden>
+  <form class="pair" id="pairForm" autocomplete="off">
+    <h1>Pair this screen</h1>
+    <p>On the hub till, add a kitchen screen and choose its station. Type the 6-digit code it shows.</p>
+    <input id="code" inputmode="numeric" pattern="[0-9]*" maxlength="6" aria-label="Pairing code" placeholder="000000">
+    <button type="submit">Pair</button>
+    <div class="err" id="pairErr" role="alert"></div>
+  </form>
+</div>
+
+<div id="kdsView" hidden>
+  <div class="bar">
+    <h1 id="screenName">Kitchen</h1>
+    <span class="stations" id="stationNames"></span>
+    <span class="spacer"></span>
+    <span class="sound" id="soundHint">Tap anywhere to turn on sound</span>
+    <span class="conn" id="conn"><span class="dot"></span><span id="connText">Connecting…</span></span>
+    <span class="clock" id="clock"></span>
+  </div>
+  <main>
+    <div id="cooking" class="grid"></div>
+    <div id="emptyMsg" class="empty" hidden>No tickets. New orders appear here by themselves.</div>
+    <div id="readyBlock" hidden>
+      <div class="section-title">Ready — waiting for the waiter</div>
+      <div id="ready" class="grid ready-row"></div>
+    </div>
+  </main>
+</div>
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+(function () {
+  'use strict';
+  var NEXT = { queued: 'preparing', preparing: 'ready' };
+  var LABEL = { queued: 'NEW', preparing: 'COOKING', ready: 'READY', served: 'SERVED', voided: 'VOID' };
+  var state = null;          // last /kds/state
+  var clockOffset = 0;       // hub time - this device's time, so ages are right even if this clock is wrong
+  var source = null;         // EventSource
+  var refreshTimer = null;
+  var audio = null;
+  var knownTickets = {};
+
+  function $(id) { return document.getElementById(id); }
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+  function uuid() {
+    var b = new Uint8Array(16); window.crypto.getRandomValues(b);
+    b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+    var h = []; for (var i = 0; i < 16; i++) h.push((b[i] + 0x100).toString(16).slice(1));
+    return h.slice(0, 4).join('') + '-' + h.slice(4, 6).join('') + '-' + h.slice(6, 8).join('') + '-' + h.slice(8, 10).join('') + '-' + h.slice(10).join('');
+  }
+  function toast(msg) {
+    var t = $('toast'); t.textContent = msg; t.style.display = 'block';
+    clearTimeout(toast.timer); toast.timer = setTimeout(function () { t.style.display = 'none'; }, 4000);
+  }
+  function api(method, url, body) {
+    var opts = { method: method, credentials: 'same-origin', headers: {} };
+    if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.headers['Idempotency-Key'] = uuid(); opts.body = JSON.stringify(body); }
+    return fetch(url, opts).then(function (res) {
+      return res.text().then(function (text) {
+        var data = {}; try { data = text ? JSON.parse(text) : {}; } catch (e) { data = {}; }
+        if (!res.ok) { var err = new Error(data.detail || 'The hub refused that.'); err.status = res.status; err.code = data.code; throw err; }
+        return data;
+      });
+    });
+  }
+
+  // ---- pairing ----------------------------------------------------------------------------
+  function showPairing(message) {
+    if (source) { source.close(); source = null; }
+    state = null;
+    $('kdsView').hidden = true; $('pairView').hidden = false;
+    $('pairErr').textContent = message || '';
+    $('code').value = ''; $('code').focus();
+  }
+  $('pairForm').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var code = $('code').value.replace(/\D/g, '');
+    if (code.length !== 6) { $('pairErr').textContent = 'The code has 6 digits.'; return; }
+    $('pairErr').textContent = '';
+    api('POST', '/hub/v1/pair', { code: code }).then(start).catch(function (e) { $('pairErr').textContent = e.message; });
+  });
+
+  // ---- live connection -----------------------------------------------------------------------
+  function setConn(kind, text) { $('conn').className = 'conn ' + kind; $('connText').textContent = text; }
+  function connect(afterSeq) {
+    if (source) source.close();
+    source = new EventSource('/hub/v1/events?after=' + encodeURIComponent(afterSeq));
+    source.onopen = function () { setConn('live', 'Live'); scheduleRefresh(0); };
+    source.onerror = function () {
+      setConn('down', 'Reconnecting…');
+      // The browser retries by itself; if it gave up, start again (it resumes from the last event seen).
+      if (source && source.readyState === 2) setTimeout(function () { if (state) connect(state.seq); }, 3000);
+    };
+    source.onmessage = function () { scheduleRefresh(150); };
+    ['ticket.created', 'ticket.item_changed', 'ticket.voided', 'menu.availability'].forEach(function (type) {
+      source.addEventListener(type, function () { if (type === 'ticket.created') beep(); scheduleRefresh(150); });
+    });
+    source.addEventListener('resync', function () { scheduleRefresh(0); });
+    source.addEventListener('unpaired', function () { showPairing('This screen was removed on the hub. Ask the manager for a new code.'); });
+  }
+  function scheduleRefresh(ms) { clearTimeout(refreshTimer); refreshTimer = setTimeout(refresh, ms); }
+  function refresh() {
+    return api('GET', '/hub/v1/kds/state').then(function (s) {
+      clockOffset = Date.parse(s.time) - Date.now();
+      state = s; render();
+    }).catch(function (e) {
+      if (e.status === 401) showPairing(e.message);
+      else setConn('down', 'Hub not reachable');
+    });
+  }
+  function start() {
+    return api('GET', '/hub/v1/kds/state').then(function (s) {
+      clockOffset = Date.parse(s.time) - Date.now();
+      state = s;
+      s.tickets.forEach(function (t) { knownTickets[t.id] = true; });
+      $('pairView').hidden = true; $('kdsView').hidden = false;
+      render();
+      connect(s.seq);
+    }).catch(function (e) {
+      if (e.status === 401) showPairing('');
+      else { setConn('down', 'Hub not reachable'); $('pairView').hidden = true; $('kdsView').hidden = false; setTimeout(start, 3000); }
+    });
+  }
+
+  // ---- sound ---------------------------------------------------------------------------------
+  document.addEventListener('pointerdown', function () {
+    if (audio) return;
+    try { audio = new (window.AudioContext || window.webkitAudioContext)(); $('soundHint').hidden = true; } catch (e) { audio = null; }
+  });
+  function beep() {
+    if (!audio) return;
+    try {
+      var o = audio.createOscillator(), g = audio.createGain();
+      o.frequency.value = 880; o.connect(g); g.connect(audio.destination);
+      g.gain.setValueAtTime(0.0001, audio.currentTime); g.gain.exponentialRampToValueAtTime(0.4, audio.currentTime + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + 0.5); o.start(); o.stop(audio.currentTime + 0.55);
+    } catch (e) { /* no sound is fine */ }
+  }
+
+  // ---- actions -------------------------------------------------------------------------------
+  function act(url, body) {
+    return api('POST', url, body).then(function () { scheduleRefresh(0); }).catch(function (e) {
+      if (e.status === 401) return showPairing(e.message);
+      if (e.code === 'version_mismatch' || e.code === 'bad_transition') toast('Someone else changed that first. Showing the latest.');
+      else toast(e.message);
+      scheduleRefresh(0);
+    });
+  }
+
+  // ---- drawing -------------------------------------------------------------------------------
+  function now() { return Date.now() + clockOffset; }
+  function age(sentAt) {
+    var s = Math.max(0, Math.floor((now() - Date.parse(sentAt)) / 1000));
+    var m = Math.floor(s / 60);
+    return { minutes: m, text: (m >= 60 ? Math.floor(m / 60) + 'h ' + (m % 60) + 'm' : m + ':' + ('0' + (s % 60)).slice(-2)) };
+  }
+  function where(t) { return t.table_label ? 'Table ' + t.table_label : (t.service_type === 'takeaway' ? 'TAKEAWAY' : 'COUNTER'); }
+  function stationName(id) {
+    var list = (state && state.screen.stations) || [];
+    for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i].name;
+    return '';
+  }
+  function ticketCard(t, compact) {
+    var a = age(t.sent_at);
+    var card = el('div', 'card');
+    card.setAttribute('data-ticket', t.id);
+    if (!compact && a.minutes >= state.late_after_minutes) card.className += ' late';
+    else if (!compact && a.minutes >= state.warn_after_minutes) card.className += ' warn';
+    var head = el('div', 'head');
+    head.appendChild(el('span', 'num', '#' + t.number));
+    head.appendChild(el('span', 'where', where(t)));
+    var ageEl = el('span', 'age', a.text); ageEl.setAttribute('data-sent', t.sent_at); head.appendChild(ageEl);
+    card.appendChild(head);
+    var subText = 'Order ' + t.order_number + (state.screen.stations.length > 1 ? ' · ' + stationName(t.station_id) : '');
+    card.appendChild(el('div', 'sub', subText));
+    var list = el('div', 'items');
+    t.items.forEach(function (i) {
+      var left = i.quantity - (i.voided_quantity || 0);
+      var row = el('button', 'item ' + i.state);
+      row.type = 'button';
+      row.setAttribute('data-item', i.id);
+      var next = NEXT[i.state];
+      if (!next || compact) row.disabled = true;
+      row.appendChild(el('span', 'qty', String(i.state === 'voided' ? i.quantity : left)));
+      var what = el('span', 'what');
+      what.appendChild(el('div', 'name', i.name));
+      (i.modifiers || []).forEach(function (m) { what.appendChild(el('div', 'mod', '+ ' + m)); });
+      if (i.notes) what.appendChild(el('div', 'note', '! ' + i.notes));
+      if (i.voided_quantity && i.state !== 'voided') what.appendChild(el('div', 'note', i.voided_quantity + ' voided' + (i.void_reason ? ': ' + i.void_reason : '')));
+      if (i.state === 'voided') what.appendChild(el('div', 'reason', 'VOID' + (i.void_reason ? ': ' + i.void_reason : '')));
+      row.appendChild(what);
+      row.appendChild(el('span', 'pill ' + i.state, LABEL[i.state] || i.state));
+      if (next && !compact) {
+        row.addEventListener('click', function () {
+          row.disabled = true;
+          act('/hub/v1/ticket-items/' + encodeURIComponent(i.id) + '/state', { to: next, version: i.version });
+        });
+      }
+      list.appendChild(row);
+    });
+    card.appendChild(list);
+    var open = t.items.some(function (i) { return i.state === 'queued' || i.state === 'preparing'; });
+    if (open && !compact) {
+      var bump = el('button', 'bump', 'All ready');
+      bump.type = 'button';
+      bump.addEventListener('click', function () { bump.disabled = true; act('/hub/v1/tickets/' + encodeURIComponent(t.id) + '/bump', {}); });
+      card.appendChild(bump);
+    }
+    return card;
+  }
+  function render() {
+    if (!state) return;
+    $('screenName').textContent = state.screen.name;
+    $('stationNames').textContent = state.screen.stations.map(function (s) { return s.name; }).join(' · ');
+    var cooking = [], ready = [];
+    state.tickets.forEach(function (t) {
+      (t.items.some(function (i) { return i.state === 'queued' || i.state === 'preparing'; }) ? cooking : ready).push(t);
+    });
+    var c = $('cooking'), r = $('ready');
+    c.innerHTML = ''; r.innerHTML = '';
+    cooking.forEach(function (t) { c.appendChild(ticketCard(t, false)); });
+    ready.forEach(function (t) { r.appendChild(ticketCard(t, true)); });
+    $('emptyMsg').hidden = cooking.length > 0 || ready.length > 0;
+    $('readyBlock').hidden = ready.length === 0;
+  }
+  function tick() {
+    var d = new Date(now());
+    // The restaurant's time (the hub's business day is Africa/Lagos), whatever zone this tablet is set to.
+    var text;
+    try { text = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: (state && state.time_zone) || 'Africa/Lagos' }); }
+    catch (e) { text = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2); }
+    $('clock').textContent = text;
+    if (!state) return;
+    var ages = document.querySelectorAll('.age[data-sent]');
+    for (var i = 0; i < ages.length; i++) {
+      var a = age(ages[i].getAttribute('data-sent'));
+      ages[i].textContent = a.text;
+      var card = ages[i].parentNode.parentNode;
+      if (card.parentNode && card.parentNode.id === 'cooking') {
+        card.className = 'card' + (a.minutes >= state.late_after_minutes ? ' late' : a.minutes >= state.warn_after_minutes ? ' warn' : '');
+      }
+    }
+  }
+  setInterval(tick, 1000);
+  setInterval(function () { if (state) scheduleRefresh(0); }, 30000); // belt and braces
+  // A tablet waking from sleep or a tab coming back: show the latest at once, not in 30 seconds.
+  window.addEventListener('focus', function () { if (state) scheduleRefresh(0); });
+  document.addEventListener('visibilitychange', function () { if (state && !document.hidden) scheduleRefresh(0); });
+  tick();
+  start();
+})();
+</script>
+</body>
+</html>

@@ -140,3 +140,15 @@ CREATE TABLE IF NOT EXISTS r_print_jobs (
   attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, created_at TEXT NOT NULL, printed_at TEXT, requested_by TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_r_print_jobs_status ON r_print_jobs(status, created_at);
+
+-- Kitchen screens on the shop's Wi-Fi (KITCHEN_WORKFLOW.md §3, OFFLINE_SYNCHRONIZATION.md §6).
+-- A screen is paired once with a 6-digit code and then holds a token. Only HASHES are stored: a
+-- copy of this database never lets anyone act as a screen.
+CREATE TABLE IF NOT EXISTS r_screens (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, station_ids TEXT NOT NULL DEFAULT '[]', token_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL, created_by TEXT, last_seen_at TEXT, revoked_at TEXT, revoked_by TEXT
+);
+CREATE TABLE IF NOT EXISTS r_pairing_codes (
+  code_hash TEXT PRIMARY KEY, name TEXT NOT NULL, station_ids TEXT NOT NULL, created_at TEXT NOT NULL, created_by TEXT,
+  expires_at TEXT NOT NULL, used_at TEXT, screen_id TEXT
+);
