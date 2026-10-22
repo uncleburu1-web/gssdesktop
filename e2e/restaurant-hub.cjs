@@ -66,8 +66,13 @@ const list = (d) => (Array.isArray(d) ? d : d.results);
   const ceo = await login('ceo');
   const branches = list(await api(ceo, 'GET', '/branches/'));
   const store = branches.find((b) => b.name === 'E2E Store').id;
-  const mods = await api(ceo, 'PUT', `/branches/${store}/modules/`, { modules: { restaurant: true } });
-  check(mods.modules.restaurant && mods.modules.retail, 'the owner switches the restaurant on (supermarket stays on)');
+  // The owner makes E2E Store a restaurant by changing its kind of shop (owner's decision 13). A server
+  // without kinds of shop ignores the field: switch the module on directly there.
+  const changed = await api(ceo, 'PATCH', `/branches/${store}/`, { shop_type: 'restaurant' });
+  const mods = changed.shop_type === 'restaurant'
+    ? await api(ceo, 'GET', `/branches/${store}/modules/`)
+    : await api(ceo, 'PUT', `/branches/${store}/modules/`, { modules: { restaurant: true } });
+  check(mods.modules.restaurant && mods.modules.retail, `the owner makes the branch a restaurant (${changed.shop_type ? 'its kind of shop' : 'older server: the module'}; supermarket stays on)`);
   const post = (url, body) => api(ceo, 'POST', `/restaurant/${url}`, body, store);
   const kitchen = await post('stations/', { name: 'Kitchen', prints: true, shows_on_screen: true });
   const bar = await post('stations/', { name: 'Bar', prints: true });
