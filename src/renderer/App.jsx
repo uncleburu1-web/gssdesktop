@@ -9,6 +9,7 @@ import PrinterSettingsScreen from './PrinterSettingsScreen.jsx';
 import ShiftScreen from './ShiftScreen.jsx';
 import DayReportScreen from './DayReport.jsx';
 import RestaurantScreen from './restaurant/RestaurantScreen.jsx';
+import { can } from './restaurant/api.js';
 import { Icons } from './Icons.jsx';
 import { fmtRelative } from './format.js';
 
@@ -19,8 +20,11 @@ function Shell() {
   const [saleTick, setSaleTick] = useState(0);
   const [pendingSync, setPendingSync] = useState(0);
   const [syncStatus, setSyncStatus] = useState(null);
-  // Restaurant branches get a Restaurant screen. The owner can switch the module on or off at any
-  // time (the till learns it from the pull), so this is checked again every few seconds.
+  // A restaurant branch's till is restaurant-first (owner's request, 23 Oct 2026): its menu is the
+  // restaurant's own (Floor, Kitchen, Sold out, Set-up, then Stock, Shift, Day report, Printer) with
+  // no shop selling, customers or sales history. Whether the branch is a restaurant comes from the
+  // hub engine (it follows the pull, so the owner changing the branch's kind reaches the till within
+  // seconds); the signed-in profile's modules give the first answer so the shop menu never flashes.
   const [restaurantOn, setRestaurantOn] = useState(false);
   const { theme, toggleTheme } = useTheme();
 
@@ -54,7 +58,10 @@ function Shell() {
 
   useEffect(() => {
     if (!loggedIn) return;
-    window.pos.getProfile().then(setProfile);
+    window.pos.getProfile().then((p) => {
+      setProfile(p);
+      if (p && Array.isArray(p.modules) && p.modules.includes('restaurant')) setRestaurantOn(true);
+    });
   }, [loggedIn]);
 
   useEffect(() => {
@@ -94,6 +101,13 @@ function Shell() {
     return unsubscribe;
   }, [loggedIn]);
 
+  // Land on the restaurant's floor (the kitchen on a cook's login) when the branch is a restaurant,
+  // and back on Sell if it stops being one.
+  useEffect(() => {
+    if (restaurantOn && !RESTAURANT_VIEWS.has(view)) setView(profile?.role === 'kitchen' ? 'r-kitchen' : 'r-floor');
+    if (!restaurantOn && view.startsWith('r-')) setView('sell');
+  }, [restaurantOn, view, profile]);
+
   if (loggedIn === null) return null; // avoid a login-screen flash while checking
   if (!loggedIn) {
     return (
@@ -122,6 +136,12 @@ function Shell() {
   // Sees every seller's sales and day report: owners/managers/CEO and roles the owner allowed.
   const seesEveryone = isOwner || Boolean(profile?.capabilities?.view_all_sales);
 
+  const restaurantItems = [
+    ['r-floor', 'Floor'], ['r-kitchen', 'Kitchen'],
+    ...(isOwner || can(profile, 'mark_sold_out') ? [['r-soldout', 'Sold out']] : []),
+    ...(isOwner || profile?.is_ceo ? [['r-setup', 'Set-up']] : []),
+  ];
+
   function handleLogout() {
     window.pos.logout().then(() => {
       setLoggedIn(false);
@@ -133,14 +153,25 @@ function Shell() {
     <div style={{ display: 'flex', height: '100vh' }}>
       <div style={{ width: 200, borderRight: '1px solid var(--border)', display: 'flex', flexDirection: 'column', padding: 14 }}>
         <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 18, padding: '0 6px' }}>{profile?.shop_name || 'My Shop'}</div>
-        {restaurantOn && <NavButton active={view === 'restaurant'} onClick={() => setView('restaurant')}>Restaurant</NavButton>}
-        <NavButton active={view === 'sell'} onClick={() => setView('sell')}>{Icons.cart} Sell</NavButton>
-        <NavButton active={view === 'products'} onClick={() => setView('products')}>Products</NavButton>
-        <NavButton active={view === 'customers'} onClick={() => setView('customers')}>Customers</NavButton>
-        <NavButton active={view === 'history'} onClick={() => setView('history')}>Sales history</NavButton>
-        <NavButton active={view === 'shift'} onClick={() => setView('shift')}>Shift</NavButton>
-        <NavButton active={view === 'dayreport'} onClick={() => setView('dayreport')}>Day report</NavButton>
-        <NavButton active={view === 'printer'} onClick={() => setView('printer')}>Printer</NavButton>
+        {restaurantOn ? (
+          <>
+            {restaurantItems.map(([id, label]) => <NavButton key={id} active={view === id} onClick={() => setView(id)}>{label}</NavButton>)}
+            <NavButton active={view === 'products'} onClick={() => setView('products')}>Stock</NavButton>
+            <NavButton active={view === 'shift'} onClick={() => setView('shift')}>Shift</NavButton>
+            <NavButton active={view === 'dayreport'} onClick={() => setView('dayreport')}>Day report</NavButton>
+            <NavButton active={view === 'printer'} onClick={() => setView('printer')}>Printer</NavButton>
+          </>
+        ) : (
+          <>
+            <NavButton active={view === 'sell'} onClick={() => setView('sell')}>{Icons.cart} Sell</NavButton>
+            <NavButton active={view === 'products'} onClick={() => setView('products')}>Products</NavButton>
+            <NavButton active={view === 'customers'} onClick={() => setView('customers')}>Customers</NavButton>
+            <NavButton active={view === 'history'} onClick={() => setView('history')}>Sales history</NavButton>
+            <NavButton active={view === 'shift'} onClick={() => setView('shift')}>Shift</NavButton>
+            <NavButton active={view === 'dayreport'} onClick={() => setView('dayreport')}>Day report</NavButton>
+            <NavButton active={view === 'printer'} onClick={() => setView('printer')}>Printer</NavButton>
+          </>
+        )}
         <div style={{ flex: 1 }} />
         <div style={{ fontSize: 11.5, color: 'var(--text-dim)', padding: '0 6px', marginBottom: 4 }}>
           {waitingSync > 0
@@ -174,7 +205,7 @@ function Shell() {
         <div className="nav-footer mono" style={{ padding: '0 6px', marginBottom: 10 }}>
           <div style={{ fontSize: 13, fontWeight: 600 }}>{profile?.full_name || profile?.username}</div>
           <div style={{ opacity: 0.6, fontSize: 10.5, marginTop: 2, textTransform: 'uppercase', letterSpacing: '.5px' }}>
-            {isOwner ? 'Owner' : 'Seller'}
+            {isOwner ? 'Owner' : ROLE_LABEL[profile?.role] || 'Seller'}
           </div>
           <button
             className="btn ghost small"
@@ -197,15 +228,20 @@ function Shell() {
         {view === 'shift' && <ShiftScreen refreshKey={saleTick} profile={profile} />}
         {view === 'dayreport' && <DayReportScreen profile={profile} seesEveryone={seesEveryone} />}
         {view === 'printer' && <PrinterSettingsScreen profile={profile} />}
-        {view === 'restaurant' && restaurantOn && <RestaurantScreen profile={profile} />}
+        {restaurantOn && view.startsWith('r-') && <RestaurantScreen profile={profile} tab={view.slice(2)} />}
       </div>
     </div>
   );
 }
 
+// The views of a restaurant branch's till (see Shell); anything else lands on the floor.
+const RESTAURANT_VIEWS = new Set(['r-floor', 'r-kitchen', 'r-soldout', 'r-setup', 'products', 'shift', 'dayreport', 'printer']);
+const ROLE_LABEL = { branch_manager: 'Manager', seller: 'Seller', cashier: 'Cashier', waiter: 'Waiter', kitchen: 'Kitchen', reception: 'Reception', technician: 'Technician', attendant: 'Attendant' };
+
 function NavButton({ active, onClick, children }) {
   return (
     <button
+      data-nav
       onClick={onClick}
       style={{
         display: 'flex', alignItems: 'center', gap: 8, textAlign: 'left', padding: '9px 10px', marginBottom: 2,
