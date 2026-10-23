@@ -12,6 +12,7 @@ export const CATEGORY_LABELS = {
   apparel_top: 'Top / Shirt', apparel_bottom: 'Trousers / Skirt', footwear: 'Footwear',
   outerwear: 'Outerwear', clothing_accessory: 'Bag / Fashion accessory',
   grocery: 'Grocery', household: 'Household item', stationery: 'Stationery', beverage: 'Beverage',
+  ingredient: 'Food ingredient', packaging: 'Packaging / takeaway pack', kitchen_supply: 'Kitchen & cleaning supply',
   other: 'Other',
 };
 
@@ -20,6 +21,8 @@ const CATEGORY_GROUPS = {
   pharmacy: ['medicine', 'tablet_capsule', 'syrup_liquid', 'injection', 'medical_supply', 'equipment'],
   clothing: ['apparel_top', 'apparel_bottom', 'footwear', 'outerwear', 'clothing_accessory'],
   general: ['grocery', 'household', 'stationery', 'beverage'],
+  // A restaurant's stock (its menu is the restaurant hub's): drinks, ingredients, packs, supplies.
+  restaurant: ['beverage', 'ingredient', 'packaging', 'kitchen_supply'],
 };
 
 // Category codes relevant to one business type, 'other' always last —
