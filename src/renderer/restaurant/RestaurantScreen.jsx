@@ -7,15 +7,18 @@ import SetupTab from './SetupTab.jsx';
 import './restaurant.css';
 
 /**
- * The restaurant on the hub till: floor, orders, kitchen, set-up. Only the branch's hub runs it
- * (main/restaurant/store.js assertHub); any other till explains why instead.
+ * The restaurant on the hub till: floor, orders, kitchen, sold out, set-up. On a restaurant branch the
+ * till's own menu picks which (App.jsx passes `tab`: floor / kitchen / soldout / setup). Only the
+ * branch's hub runs it (main/restaurant/store.js assertHub); any other till explains why instead.
  */
-export default function RestaurantScreen({ profile }) {
+const TITLES = { floor: 'Floor', kitchen: 'Kitchen', soldout: 'Sold out', setup: 'Set-up' };
+
+export default function RestaurantScreen({ profile, tab = 'floor' }) {
   const [status, setStatus] = useState(null);
-  const [tab, setTab] = useState('floor');
   const [orderId, setOrderId] = useState(null);
   const [tick, setTick] = useState(0);
 
+  useEffect(() => { setOrderId(null); }, [tab]); // choosing a menu item leaves an open order
   const loadStatus = useCallback(() => r('status').then(setStatus).catch(() => setStatus({ restaurant: false })), []);
   useEffect(() => { loadStatus(); const t = setInterval(loadStatus, 10000); return () => clearInterval(t); }, [loadStatus]);
   useHubChanges(() => setTick((t) => t + 1), Boolean(status && status.is_hub));
@@ -40,25 +43,21 @@ export default function RestaurantScreen({ profile }) {
   if (orderId) {
     return <OrderPad orderId={orderId} profile={profile} tick={tick} onClose={() => { setOrderId(null); setTick((t) => t + 1); }} />;
   }
-  const tabs = [['floor', 'Floor'], ['kitchen', 'Kitchen'], ...(can(profile, 'mark_sold_out') || profile?.is_owner ? [['menu', 'Sold out']] : []),
-    ...(profile?.is_owner || profile?.is_ceo ? [['setup', 'Set-up']] : [])];
+  const allowed = tab === 'soldout' ? (can(profile, 'mark_sold_out') || profile?.is_owner)
+    : tab === 'setup' ? (profile?.is_owner || profile?.is_ceo) : true;
   return (
     <div>
       <div className="r-head">
         <div>
-          <div className="r-title">Restaurant</div>
+          <div className="r-title">{TITLES[tab] || 'Restaurant'}</div>
           <div className="r-sub">This till is the restaurant hub. Everything works without internet.</div>
         </div>
-        <div className="tabs">
-          {tabs.map(([id, label]) => (
-            <button key={id} className={`tab${tab === id ? ' active' : ''}`} onClick={() => setTab(id)}>{label}</button>
-          ))}
-        </div>
       </div>
-      {tab === 'floor' && <Floor profile={profile} tick={tick} onOpen={setOrderId} />}
-      {tab === 'kitchen' && <KitchenTab profile={profile} tick={tick} />}
-      {tab === 'menu' && <SoldOut tick={tick} />}
-      {tab === 'setup' && <SetupTab profile={profile} tick={tick} />}
+      {!allowed && <Notice title="Not for this login">Ask the owner or manager.</Notice>}
+      {allowed && tab === 'floor' && <Floor profile={profile} tick={tick} onOpen={setOrderId} />}
+      {allowed && tab === 'kitchen' && <KitchenTab profile={profile} tick={tick} />}
+      {allowed && tab === 'soldout' && <SoldOut tick={tick} />}
+      {allowed && tab === 'setup' && <SetupTab profile={profile} tick={tick} />}
     </div>
   );
 }
